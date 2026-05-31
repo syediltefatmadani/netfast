@@ -9,8 +9,44 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as ViolationsRouteImport } from './routes/violations'
+import { Route as TerminationRouteImport } from './routes/termination'
+import { Route as StrugglingRouteImport } from './routes/struggling'
+import { Route as PaymentRouteImport } from './routes/payment'
+import { Route as OnboardingRouteImport } from './routes/onboarding'
+import { Route as DashboardRouteImport } from './routes/dashboard'
 import { Route as IndexRouteImport } from './routes/index'
 
+const ViolationsRoute = ViolationsRouteImport.update({
+  id: '/violations',
+  path: '/violations',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const TerminationRoute = TerminationRouteImport.update({
+  id: '/termination',
+  path: '/termination',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const StrugglingRoute = StrugglingRouteImport.update({
+  id: '/struggling',
+  path: '/struggling',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PaymentRoute = PaymentRouteImport.update({
+  id: '/payment',
+  path: '/payment',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const OnboardingRoute = OnboardingRouteImport.update({
+  id: '/onboarding',
+  path: '/onboarding',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DashboardRoute = DashboardRouteImport.update({
+  id: '/dashboard',
+  path: '/dashboard',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
@@ -19,28 +55,116 @@ const IndexRoute = IndexRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/dashboard': typeof DashboardRoute
+  '/onboarding': typeof OnboardingRoute
+  '/payment': typeof PaymentRoute
+  '/struggling': typeof StrugglingRoute
+  '/termination': typeof TerminationRoute
+  '/violations': typeof ViolationsRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/dashboard': typeof DashboardRoute
+  '/onboarding': typeof OnboardingRoute
+  '/payment': typeof PaymentRoute
+  '/struggling': typeof StrugglingRoute
+  '/termination': typeof TerminationRoute
+  '/violations': typeof ViolationsRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/dashboard': typeof DashboardRoute
+  '/onboarding': typeof OnboardingRoute
+  '/payment': typeof PaymentRoute
+  '/struggling': typeof StrugglingRoute
+  '/termination': typeof TerminationRoute
+  '/violations': typeof ViolationsRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/'
+  fullPaths:
+    | '/'
+    | '/dashboard'
+    | '/onboarding'
+    | '/payment'
+    | '/struggling'
+    | '/termination'
+    | '/violations'
   fileRoutesByTo: FileRoutesByTo
-  to: '/'
-  id: '__root__' | '/'
+  to:
+    | '/'
+    | '/dashboard'
+    | '/onboarding'
+    | '/payment'
+    | '/struggling'
+    | '/termination'
+    | '/violations'
+  id:
+    | '__root__'
+    | '/'
+    | '/dashboard'
+    | '/onboarding'
+    | '/payment'
+    | '/struggling'
+    | '/termination'
+    | '/violations'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  DashboardRoute: typeof DashboardRoute
+  OnboardingRoute: typeof OnboardingRoute
+  PaymentRoute: typeof PaymentRoute
+  StrugglingRoute: typeof StrugglingRoute
+  TerminationRoute: typeof TerminationRoute
+  ViolationsRoute: typeof ViolationsRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/violations': {
+      id: '/violations'
+      path: '/violations'
+      fullPath: '/violations'
+      preLoaderRoute: typeof ViolationsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/termination': {
+      id: '/termination'
+      path: '/termination'
+      fullPath: '/termination'
+      preLoaderRoute: typeof TerminationRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/struggling': {
+      id: '/struggling'
+      path: '/struggling'
+      fullPath: '/struggling'
+      preLoaderRoute: typeof StrugglingRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/payment': {
+      id: '/payment'
+      path: '/payment'
+      fullPath: '/payment'
+      preLoaderRoute: typeof PaymentRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/onboarding': {
+      id: '/onboarding'
+      path: '/onboarding'
+      fullPath: '/onboarding'
+      preLoaderRoute: typeof OnboardingRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/dashboard': {
+      id: '/dashboard'
+      path: '/dashboard'
+      fullPath: '/dashboard'
+      preLoaderRoute: typeof DashboardRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/': {
       id: '/'
       path: '/'
@@ -53,7 +177,23 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  DashboardRoute: DashboardRoute,
+  OnboardingRoute: OnboardingRoute,
+  PaymentRoute: PaymentRoute,
+  StrugglingRoute: StrugglingRoute,
+  TerminationRoute: TerminationRoute,
+  ViolationsRoute: ViolationsRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
   ._addFileTypes<FileRouteTypes>()
+
+import type { getRouter } from './router.tsx'
+import type { startInstance } from './start.ts'
+declare module '@tanstack/react-start' {
+  interface Register {
+    ssr: true
+    router: Awaited<ReturnType<typeof getRouter>>
+    config: Awaited<ReturnType<typeof startInstance.getOptions>>
+  }
+}

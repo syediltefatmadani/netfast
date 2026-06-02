@@ -26,20 +26,35 @@ export default function Onboarding() {
 
   const submit = async () => {
     if (!agree || !identity || !tier) return;
-    const payload = {
-      status: 'active',
-      day: 1,
-      totalDays: tier.days,
-      deposit: tier.deposit,
-      tier: tier.name,
-      identityStatement: identity,
-      accountabilityPartner: partner || null,
-      vpnExemption: usesVpn ? { adapter: vpnAdapter, start: vpnStart, end: vpnEnd } : null,
-      createdAt: Date.now(),
-    };
-    const ch = await createChallenge(payload);
-    setChallenge({ ...payload, id: ch.id });
-    navigate({ to: '/payment' });
+    try {
+      const payload = {
+        tier: tier.name,
+        identityStatement: identity,
+        accountabilityPartner: partner || null,
+        vpnExemption: usesVpn ? { adapter: vpnAdapter, start: vpnStart, end: vpnEnd } : null,
+      };
+      const ch = await createChallenge(payload);
+      setChallenge({
+        id: ch._id || ch.id,
+        status: ch.status,
+        day: 1,
+        totalDays: ch.totalDays,
+        deposit: ch.deposit,
+        tier: ch.tier,
+        identityStatement: ch.identityStatement,
+        accountabilityPartner: ch.accountabilityPartner,
+        vpnExemption: ch.vpnExemption,
+        createdAt: ch.createdAt,
+      });
+      navigate({ to: '/payment' });
+    } catch (err) {
+      console.error(err);
+      alert(
+        err.message?.includes('fetch')
+          ? 'Cannot reach the API server. Run: npm run dev:server (from the netfast folder) and ensure VITE_API_URL in .env matches PORT.'
+          : err.message || 'Failed to create challenge',
+      );
+    }
   };
 
   return (

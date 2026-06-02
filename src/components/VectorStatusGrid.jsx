@@ -31,9 +31,9 @@ export default function VectorStatusGrid() {
       <h3 className="text-sm uppercase tracking-wider text-zinc-500 mb-4">Vector Status</h3>
       <div className="space-y-2">
         {Object.entries(VECTOR_META).map(([key, meta]) => {
-          const entry = vectorStatus[key] || { warnings: 0 };
+          const entry = vectorStatus[key] || {};
           const Icon = meta.icon;
-          const isWarn = entry.warnings >= 1;
+          const isWarn = entry.violated === true || (entry.warnings ?? 0) >= 1;
           return (
             <div
               key={key}

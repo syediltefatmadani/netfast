@@ -2,6 +2,7 @@ const { Resend } = require('resend');
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 const LABELS = {
+  dns_filtering: 'DNS Filtering (DoH)',
   dns_ipv4: 'IPv4 DNS Integrity',
   dns_ipv6: 'IPv6 DNS Integrity',
   dns_reset: 'DNS Configuration',

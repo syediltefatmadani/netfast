@@ -3,8 +3,9 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const logger = require('./logger');
-const { verifyDNS, verifyTeredoDisabled } = require('./dns');
+const dnsModule = require('./dns');
 const { getHostsPath } = require('./hosts');
+const { getDnsHealthMonitor, isProtectionActive } = require('./services/dns');
 
 let hostsHash = null;
 
@@ -14,12 +15,16 @@ function resetHostsBaseline() {
 
 const hash = (f) => crypto.createHash('md5').update(fs.readFileSync(f)).digest('hex');
 
+const { getWatchdogAllowedProcessNames } = require('./processExclusions');
+const { checkUnknownVpn } = require('./vpnDetect');
+
 const ROGUE_DNS_ALLOW = new Set([
   'svchost.exe',
   'System',
   'dns.exe',
   'lsass.exe',
   'services.exe',
+  ...getWatchdogAllowedProcessNames(),
 ]);
 
 function readJsonFile(filePath) {
@@ -35,19 +40,28 @@ function localPortFromNetstatAddr(addr) {
 }
 
 const VECTOR_LABELS = {
-  dns_ipv4: 'IPv4 DNS Integrity',
+  dns_filtering: 'Filtering Effectiveness',
+  dns_provider_miss: 'CleanBrowsing Provider Miss',
+  fallback_blocking: 'Local Fallback Blocking',
+  dns_ipv4: 'DNS Integrity',
   dns_ipv6: 'IPv6 DNS Integrity',
+  windows_doh: 'DoH Configuration',
   firefox_doh: 'Firefox Secure DNS',
   chrome_doh: 'Chrome Secure DNS',
   ipv6_tunnel: 'IPv6 Tunnel Adapters',
   hosts_modified: 'Hosts File Integrity',
   rogue_dns: 'DNS Port Monitor',
+  unknown_vpn: 'VPN/Proxy Detection',
 };
 
 function logVector(key, result) {
   const label = VECTOR_LABELS[key] || key;
   const status = result.violated ? 'VIOLATED' : 'OK';
-  const extra = result.process ? { process: result.process } : undefined;
+  let extra;
+  if (result.process) extra = { process: result.process };
+  else if (result.adapters?.length) {
+    extra = { adapters: result.adapters.map((a) => `${a.name} (${a.description})`) };
+  }
   logger.info('WATCHDOG', `${label}: ${status}`, extra);
 }
 
@@ -62,8 +76,15 @@ function checkFirefoxDoH() {
       const prefs = path.join(p, profile, 'prefs.js');
       if (!fs.existsSync(prefs)) continue;
       const content = fs.readFileSync(prefs, 'utf8');
-      if (content.includes('"network.trr.mode", 2') || content.includes('"network.trr.mode", 3')) {
-        return { violated: true, profile };
+      const modeOn =
+        content.includes('"network.trr.mode", 2') || content.includes('"network.trr.mode", 3');
+      if (modeOn) {
+        const trrUriMatch = content.match(/"network\.trr\.uri",\s*"([^"]+)"/);
+        const uri = trrUriMatch ? trrUriMatch[1] : '';
+        const { isCleanBrowsingDohTemplate } = require('./browserPolicy');
+        if (!isCleanBrowsingDohTemplate(uri)) {
+          return { violated: true, profile, uri: uri || 'unknown' };
+        }
       }
     }
     return { violated: false };
@@ -74,6 +95,7 @@ function checkFirefoxDoH() {
 }
 
 function checkChromiumDoH() {
+  const { isCleanBrowsingDohTemplate } = require('./browserPolicy');
   const files = [
     { browser: 'Chrome', path: path.join(process.env.LOCALAPPDATA, 'Google\\Chrome\\User Data\\Default\\Preferences') },
     { browser: 'Edge', path: path.join(process.env.LOCALAPPDATA, 'Microsoft\\Edge\\User Data\\Default\\Preferences') },
@@ -82,9 +104,23 @@ function checkChromiumDoH() {
     try {
       if (!fs.existsSync(f)) continue;
       const data = readJsonFile(f);
-      const mode = data?.dns_over_https?.mode;
-      if (mode && mode !== 'off') return { violated: true, browser, mode };
-      logger.info('WATCHDOG', `${browser} Secure DNS: OK`, { mode: mode || 'off' });
+      const doh = data?.dns_over_https || {};
+      const mode = doh.mode || 'off';
+      const templates = doh.templates || doh.template || '';
+      const ok =
+        mode === 'off' ||
+        (isCleanBrowsingDohTemplate(templates) &&
+          (mode === 'secure' || mode === 'automatic'));
+      if (!ok) {
+        return {
+          violated: true,
+          browser,
+          mode,
+          templates,
+          reason: 'non_cleanbrowsing_doh',
+        };
+      }
+      logger.info('WATCHDOG', `${browser} Secure DNS: OK`, { mode, templates: templates || 'default' });
     } catch (e) {
       logger.warn('WATCHDOG', `${browser} DoH check skipped`, e.message);
     }
@@ -171,29 +207,112 @@ function getBatteryState() {
 
 function runFullCheck() {
   logger.info('WATCHDOG', '——— Full integrity check ———');
-  const dns = verifyDNS();
+  const dns = dnsModule.verifyDNS();
   const battery = getBatteryState();
 
+  const hostsState = checkHostsFile();
+  const probes = dns.probes || [];
+  const filterProbe = probes.find((p) => p.label?.includes('CleanBrowsing'));
+  if (filterProbe && !filterProbe.blocked) {
+    logger.warn('WATCHDOG', 'CleanBrowsing filter probe failed — sites may be reachable', filterProbe);
+  }
+
+  const healthReport = getDnsHealthMonitor().getLastReport();
+  const summary = healthReport?.validation?.summary;
+  const criticalUnblocked = (summary?.criticalUnblockedRestrictedDomains || []).length > 0;
+  const knownAdultBlockedByDoh = summary?.knownAdultBlockedByDoh ?? false;
+  const providerMisses = summary?.providerMisses || healthReport?.providerMisses || [];
+  const fallbackBlockedMisses =
+    summary?.fallbackBlockedMisses || healthReport?.fallbackBlockedMisses || [];
+  const filteringActive = dns.filteringActive;
+
+  const dnsFilteringViolated =
+    criticalUnblocked ||
+    (!knownAdultBlockedByDoh &&
+      !(healthReport?.healthy) &&
+      fallbackBlockedMisses.length < providerMisses.length);
+
   const vectors = {
-    dns_ipv4: { violated: !dns.ipv4.intact },
-    dns_ipv6: { violated: !dns.ipv6.intact },
+    dns_filtering: {
+      violated: dnsFilteringViolated,
+      status: healthReport?.status,
+      details: healthReport?.details,
+      finalStatus: healthReport?.finalStatus,
+      criticalUnblocked: summary?.criticalUnblockedRestrictedDomains || [],
+    },
+    dns_provider_miss: {
+      violated: false,
+      warning: providerMisses.length > 0,
+      severity: 'warning',
+      vector: 'dns_filtering_provider_miss',
+      domains: providerMisses,
+      fallbackBlocked: fallbackBlockedMisses,
+    },
+    fallback_blocking: {
+      violated: false,
+      active:
+        fallbackBlockedMisses.length > 0 ||
+        (require('./hosts').useHostsBlocklist() &&
+          require('./hosts').getAllBlockedDomains().length > 0),
+      layers: fallbackBlockedMisses.length ? ['hosts_supplement'] : [],
+    },
+    dns_ipv4: {
+      violated: !dns.ipv4Locked,
+      rogue: (dns.rogueServers || []).filter((r) => r.family === 'IPv4'),
+      dohStatus: healthReport?.status,
+    },
+    dns_ipv6: {
+      violated: !dns.ipv6Locked,
+      rogue: (dns.rogueServers || []).filter((r) => r.family === 'IPv6'),
+    },
+    windows_doh: {
+      violated: !dns.dohConfigured,
+      status: healthReport?.status,
+    },
     firefox_doh: checkFirefoxDoH(),
     chrome_doh: checkChromiumDoH(),
-    ipv6_tunnel: { violated: !verifyTeredoDisabled() },
-    hosts_modified: checkHostsFile(),
+    ipv6_tunnel: { violated: !dnsModule.verifyTeredoDisabled() },
+    hosts_modified: hostsState,
     rogue_dns: checkRogueDNS(),
+    unknown_vpn: checkUnknownVpn(),
   };
 
   for (const [key, result] of Object.entries(vectors)) {
+    if (key === 'dns_provider_miss' || key === 'fallback_blocking') {
+      if (result.warning || result.active) {
+        logger.info('WATCHDOG', `${VECTOR_LABELS[key]}: ${result.warning ? 'WARNING' : 'ACTIVE'}`, {
+          domains: result.domains,
+          layers: result.layers,
+        });
+      }
+      continue;
+    }
     logVector(key, result);
   }
 
-  const integrityOk = !Object.values(vectors).some((v) => v.violated);
-  logger.info('WATCHDOG', `Check complete — integrity ${integrityOk ? 'OK' : 'FAILED'}`);
+  const integrityOk = !Object.entries(vectors)
+    .filter(
+      ([k]) =>
+        k !== 'dns_provider_miss' &&
+        k !== 'fallback_blocking' &&
+        !(k === 'hosts_modified' && vectors.hosts_modified?.reason === 'hosts_unavailable'),
+    )
+    .some(([, v]) => v.violated);
+
+  const protectionWithWarningsOnly =
+    integrityOk && providerMisses.length > 0 && !criticalUnblocked;
+
+  logger.info(
+    'WATCHDOG',
+    `Check complete — ${protectionWithWarningsOnly ? 'OK (provider misses handled by fallback)' : integrityOk ? 'integrity OK' : 'integrity FAILED'}`,
+  );
 
   return {
     integrityOk,
+    protectionWithWarningsOnly,
     vectors,
+    blockProbes: probes,
+    dnsHealth: healthReport,
     ...battery,
     timestamp: Date.now(),
   };

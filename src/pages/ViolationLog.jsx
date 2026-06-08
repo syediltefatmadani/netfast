@@ -7,9 +7,10 @@ import {
 import { useChallengeStore } from '../store/challengeStore';
 
 const LABELS = {
-  dns_ipv4: 'IPv4 DNS Integrity', dns_ipv6: 'IPv6 DNS Integrity',
+  dns_filtering: 'Filtering Effectiveness',
+  dns_ipv4: 'DNS Integrity', dns_ipv6: 'IPv6 DNS Integrity',
   firefox_doh: 'Firefox Secure DNS', chrome_doh: 'Chrome Secure DNS',
-  windows_doh: 'System DNS Encryption', ipv6_tunnel: 'IPv6 Tunnel Adapters',
+  windows_doh: 'DoH Configuration', ipv6_tunnel: 'IPv6 Tunnel Adapters',
   hosts_modified: 'Hosts File Integrity', rogue_dns: 'DNS Port Monitor',
   unknown_vpn: 'VPN/Proxy Detection', watchdog_killed: 'Watchdog Process',
   app_tampered: 'App Integrity',

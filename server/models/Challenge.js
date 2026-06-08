@@ -26,6 +26,7 @@ const ChallengeSchema = new mongoose.Schema({
   razorpayPaymentId: String,
   razorpayOrderId: String,
   vectors: {
+    dns_filtering: { type: vectorSchema, default: () => ({}) },
     dns_ipv4: { type: vectorSchema, default: () => ({}) },
     dns_ipv6: { type: vectorSchema, default: () => ({}) },
     firefox_doh: { type: vectorSchema, default: () => ({}) },

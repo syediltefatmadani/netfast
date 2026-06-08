@@ -6,16 +6,23 @@
   "sideEffects": false,
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"npm run dev:server\" \"npm run dev:react\" \"npm run dev:electron\"",
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:react\" \"npm run dev:electron:safe\"",
     "dev:react": "vite dev",
-    "dev:electron": "wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .",
+    "dev:electron": "npm run dev:electron:safe",
+    "dev:electron:safe": "wait-on http://localhost:5173 && cross-env NODE_ENV=development NETFAST_DISABLE_ENFORCEMENT=true electron .",
+    "dev:electron:enforce": "wait-on http://localhost:5173 && cross-env NODE_ENV=development NETFAST_DISABLE_ENFORCEMENT=false NETFAST_ALLOW_REAL_ENFORCEMENT=true electron .",
+    "dev:enforce": "concurrently \"npm run dev:server\" \"npm run dev:react\" \"npm run dev:electron:enforce\"",
+    "reset:network": "powershell -ExecutionPolicy Bypass -File scripts/reset-netfast-network.ps1",
     "dev:server": "nodemon server/index.js",
     "build": "vite build && electron-builder",
     "build:dev": "vite build --mode development",
     "server": "node server/index.js",
     "preview": "vite preview",
     "lint": "eslint .",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "test:dns": "node --test electron/services/dns/tests/*.test.js",
+    "health-doh": "node electron/cli.js health-doh",
+    "diagnose-domain": "node electron/cli.js diagnose-domain"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.2.2",

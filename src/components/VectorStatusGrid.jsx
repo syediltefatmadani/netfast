@@ -2,11 +2,12 @@ import { Shield, Globe, Wifi, FileCode, Activity, Plug } from 'lucide-react';
 import { useChallengeStore } from '../store/challengeStore';
 
 const VECTOR_META = {
-  dns_ipv4:        { label: 'IPv4 DNS Integrity',       icon: Shield },
-  dns_ipv6:        { label: 'IPv6 DNS Integrity',       icon: Shield },
-  firefox_doh:     { label: 'Firefox Secure DNS',       icon: Globe },
-  chrome_doh:      { label: 'Chrome Secure DNS',        icon: Globe },
-  windows_doh:     { label: 'System DNS Encryption',    icon: Globe },
+  dns_filtering:   { label: 'Filtering Effectiveness', icon: Shield },
+  dns_ipv4:        { label: 'DNS Integrity',           icon: Shield },
+  dns_ipv6:        { label: 'IPv6 DNS Integrity',      icon: Shield },
+  windows_doh:     { label: 'DoH Configuration',       icon: Globe },
+  firefox_doh:     { label: 'Firefox Secure DNS',      icon: Globe },
+  chrome_doh:      { label: 'Chrome Secure DNS',       icon: Globe },
   ipv6_tunnel:     { label: 'IPv6 Tunnel Adapters',     icon: Wifi },
   hosts_modified:  { label: 'Hosts File Integrity',     icon: FileCode },
   rogue_dns:       { label: 'DNS Port Monitor',         icon: Wifi },

@@ -1,0 +1,62 @@
+{
+  "savedAt": "2026-06-07T06:11:52.828Z",
+  "strictMode": false,
+  "adapters": [
+    {
+      "interfaceAlias": "Wi-Fi",
+      "interfaceDescription": "MediaTek Wi-Fi 6E MT7922 (RZ616) 160MHz PCIe Adapter",
+      "ipv4Dns": [
+        "185.228.168.168",
+        "185.228.169.168"
+      ],
+      "ipv6Dns": [
+        "2a0d:2a00:1::",
+        "2a0d:2a00:2::"
+      ],
+      "ipv6BindingEnabled": true,
+      "interfaceMetric": 35,
+      "savedAt": "2026-06-06T18:34:13.051Z"
+    },
+    {
+      "interfaceAlias": "Bluetooth Network Connection",
+      "interfaceDescription": "Bluetooth Device (Personal Area Network)",
+      "ipv4Dns": [],
+      "ipv6Dns": [
+        "fec0:0:0:ffff::1",
+        "fec0:0:0:ffff::2",
+        "fec0:0:0:ffff::3"
+      ],
+      "ipv6BindingEnabled": true,
+      "interfaceMetric": 65,
+      "savedAt": "2026-06-06T18:41:14.384Z"
+    },
+    {
+      "interfaceAlias": "Local Area Connection",
+      "interfaceDescription": "TAP-Windows Adapter V9",
+      "ipv4Dns": [
+        "8.8.8.8",
+        "8.8.4.4"
+      ],
+      "ipv6Dns": [
+        "2a0d:2a00:1::",
+        "2a0d:2a00:2::"
+      ],
+      "ipv6BindingEnabled": true,
+      "interfaceMetric": 6,
+      "savedAt": "2026-06-06T18:41:14.384Z"
+    },
+    {
+      "interfaceAlias": "Ethernet",
+      "interfaceDescription": "Realtek Gaming GbE Family Controller",
+      "ipv4Dns": [],
+      "ipv6Dns": [
+        "fec0:0:0:ffff::1",
+        "fec0:0:0:ffff::2",
+        "fec0:0:0:ffff::3"
+      ],
+      "ipv6BindingEnabled": true,
+      "interfaceMetric": 75,
+      "savedAt": "2026-06-06T18:41:14.384Z"
+    }
+  ]
+}

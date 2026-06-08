@@ -15,8 +15,9 @@ router.post('/', auth, async (req, res, next) => {
       onACPower,
     });
 
-    if (!integrityOk && vectors) {
+    if (vectors) {
       for (const [vectorName, vectorData] of Object.entries(vectors)) {
+        if (vectorName === 'unknown_vpn' && vectorData.vpnHandlerManaged) continue;
         if (vectorData.violated) {
           await processViolation(challengeId, vectorName, {
             batteryPercent,
@@ -25,6 +26,11 @@ router.post('/', auth, async (req, res, next) => {
           });
         }
       }
+    }
+
+    if (req.body.vpnViolation) {
+      const { processVpnViolation } = require('../services/violationEngine');
+      await processVpnViolation(challengeId, req.body.vpnViolation);
     }
     res.json({ received: true, timestamp: Date.now() });
   } catch (err) {

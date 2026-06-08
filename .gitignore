@@ -17,6 +17,10 @@ dist-ssr
 *.local
 .env
 
+# Local VPN warning / snapshot state (survives app restart)
+data/vpn-warning-state.json
+data/pre-lockdown-snapshot.json
+
 # Wrangler / Cloudflare
 .wrangler/
 .dev.vars

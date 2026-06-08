@@ -8,6 +8,7 @@ export async function login(email, password) {
   });
   const data = await res.json();
   if (data.token) localStorage.setItem('fl_token', data.token);
+  if (data.userId) localStorage.setItem('fl_user_id', data.userId);
   return data;
 }
 
@@ -19,6 +20,7 @@ export async function register(payload) {
   });
   const data = await res.json();
   if (data.token) localStorage.setItem('fl_token', data.token);
+  if (data.userId) localStorage.setItem('fl_user_id', data.userId);
   return data;
 }
 
@@ -43,6 +45,7 @@ export async function ensureAuth() {
   const loginData = await loginRes.json();
   if (loginData.token) {
     localStorage.setItem('fl_token', loginData.token);
+    if (loginData.userId) localStorage.setItem('fl_user_id', loginData.userId);
     return;
   }
 

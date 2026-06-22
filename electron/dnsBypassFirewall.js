@@ -1,5 +1,5 @@
 const logger = require('./logger');
-const { runEncoded } = require('./powershell');
+const { runEncoded, runEncodedAsync } = require('./powershell');
 
 const ADMIN_PRIVILEGE_MESSAGE =
   'DNS firewall lock requires Administrator privileges. Please restart NetFast as Administrator.';
@@ -37,10 +37,9 @@ function isAdminElevationError(msg) {
   );
 }
 
-function listRawDnsBlockRuleStatus() {
-  try {
-    const namesJson = JSON.stringify(RAW_DNS_BLOCK_RULES.map((r) => r.displayName));
-    const out = runEncoded(`
+function buildRawDnsBlockRuleStatusScript() {
+  const namesJson = JSON.stringify(RAW_DNS_BLOCK_RULES.map((r) => r.displayName));
+  return `
 $names = '${namesJson.replace(/'/g, "''")}' | ConvertFrom-Json
 $rows = foreach ($n in $names) {
   $rule = Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -60,16 +59,37 @@ $rows = foreach ($n in $names) {
   }
 }
 $rows | ConvertTo-Json -Compress -Depth 4
-`);
-    const parsed = JSON.parse(out.trim() || '[]');
-    return Array.isArray(parsed) ? parsed : [parsed];
+`;
+}
+
+function parseRawDnsBlockRuleStatus(out) {
+  const parsed = JSON.parse(out.trim() || '[]');
+  return Array.isArray(parsed) ? parsed : [parsed];
+}
+
+function rawDnsBlockRuleStatusFallback() {
+  return RAW_DNS_BLOCK_RULES.map((r) => ({
+    displayName: r.displayName,
+    exists: false,
+    enabled: false,
+  }));
+}
+
+function listRawDnsBlockRuleStatus() {
+  try {
+    return parseRawDnsBlockRuleStatus(runEncoded(buildRawDnsBlockRuleStatusScript()));
   } catch (e) {
     logger.warn('FIREWALL', 'Could not list raw DNS block rules', e.message);
-    return RAW_DNS_BLOCK_RULES.map((r) => ({
-      displayName: r.displayName,
-      exists: false,
-      enabled: false,
-    }));
+    return rawDnsBlockRuleStatusFallback();
+  }
+}
+
+async function listRawDnsBlockRuleStatusAsync() {
+  try {
+    return parseRawDnsBlockRuleStatus(await runEncodedAsync(buildRawDnsBlockRuleStatusScript()));
+  } catch (e) {
+    logger.warn('FIREWALL', 'Could not list raw DNS block rules', e.message);
+    return rawDnsBlockRuleStatusFallback();
   }
 }
 
@@ -183,8 +203,7 @@ function applyRawDnsBlockRules() {
   };
 }
 
-function verifyRawDnsBlockRules() {
-  const status = listRawDnsBlockRuleStatus();
+function summarizeRawDnsBlockRules(status) {
   const missing = status.filter((r) => !r.exists).map((r) => r.displayName);
   const disabled = status.filter((r) => r.exists && !r.enabled).map((r) => r.displayName);
   const allEnabled = missing.length === 0 && disabled.length === 0;
@@ -194,6 +213,14 @@ function verifyRawDnsBlockRules() {
     missing,
     disabled,
   };
+}
+
+function verifyRawDnsBlockRules() {
+  return summarizeRawDnsBlockRules(listRawDnsBlockRuleStatus());
+}
+
+async function verifyRawDnsBlockRulesAsync() {
+  return summarizeRawDnsBlockRules(await listRawDnsBlockRuleStatusAsync());
 }
 
 function refreshRawDnsBlockRules() {
@@ -208,6 +235,8 @@ module.exports = {
   applyRawDnsBlockRules,
   removeRawDnsBlockRules,
   verifyRawDnsBlockRules,
+  verifyRawDnsBlockRulesAsync,
   refreshRawDnsBlockRules,
   listRawDnsBlockRuleStatus,
+  listRawDnsBlockRuleStatusAsync,
 };

@@ -1,4 +1,5 @@
 const { execSync } = require('child_process');
+const { execAsync } = require('./asyncExec');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -16,7 +17,7 @@ function resetHostsBaseline() {
 const hash = (f) => crypto.createHash('md5').update(fs.readFileSync(f)).digest('hex');
 
 const { getWatchdogAllowedProcessNames } = require('./processExclusions');
-const { checkUnknownVpn } = require('./vpnDetect');
+const { checkUnknownVpn, checkUnknownVpnAsync } = require('./vpnDetect');
 
 const ROGUE_DNS_ALLOW = new Set([
   'svchost.exe',
@@ -128,28 +129,57 @@ function checkChromiumDoH() {
   return { violated: false };
 }
 
+function parseDns53Listeners(out) {
+  const listeners = [];
+  for (const line of out.split('\n')) {
+    if (!line.includes('LISTENING')) continue;
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 4) continue;
+    const localAddr = parts[1];
+    const port = localPortFromNetstatAddr(localAddr);
+    if (port !== '53') continue;
+    const pid = parts[parts.length - 1];
+    listeners.push({ localAddr, pid });
+  }
+  return listeners;
+}
+
+function isAllowedDnsProcess(name) {
+  const base = name.toLowerCase();
+  return [...ROGUE_DNS_ALLOW].some((a) => base === a.toLowerCase() || base.includes('svchost'));
+}
+
+function processNameFromTasklistCsv(csv) {
+  return csv.split(',')[0].replace(/"/g, '');
+}
+
 function checkRogueDNS() {
   try {
-    const out = execSync('netstat -ano', { encoding: 'utf8' });
-    const listeners = [];
-    for (const line of out.split('\n')) {
-      if (!line.includes('LISTENING')) continue;
-      const parts = line.trim().split(/\s+/);
-      if (parts.length < 4) continue;
-      const localAddr = parts[1];
-      const port = localPortFromNetstatAddr(localAddr);
-      if (port !== '53') continue;
-      const pid = parts[parts.length - 1];
-      listeners.push({ localAddr, pid });
-    }
+    const listeners = parseDns53Listeners(execSync('netstat -ano', { encoding: 'utf8' }));
     logger.info('WATCHDOG', 'DNS port 53 listeners', { count: listeners.length, listeners });
     for (const { localAddr, pid } of listeners) {
-      const name = execSync(`tasklist /FI "PID eq ${pid}" /FO CSV /NH`, { encoding: 'utf8' })
-        .split(',')[0]
-        .replace(/"/g, '');
-      const base = name.toLowerCase();
-      const allowed = [...ROGUE_DNS_ALLOW].some((a) => base === a.toLowerCase() || base.includes('svchost'));
-      if (!allowed) return { violated: true, process: name, pid, localAddr };
+      const name = processNameFromTasklistCsv(
+        execSync(`tasklist /FI "PID eq ${pid}" /FO CSV /NH`, { encoding: 'utf8' }),
+      );
+      if (!isAllowedDnsProcess(name)) return { violated: true, process: name, pid, localAddr };
+    }
+    return { violated: false };
+  } catch {
+    logger.info('WATCHDOG', 'DNS Port Monitor: OK (no listeners on :53)');
+    return { violated: false };
+  }
+}
+
+/** Non-blocking variant of checkRogueDNS for the read/verify UI path. */
+async function checkRogueDNSAsync() {
+  try {
+    const listeners = parseDns53Listeners(await execAsync('netstat -ano'));
+    logger.info('WATCHDOG', 'DNS port 53 listeners', { count: listeners.length, listeners });
+    for (const { localAddr, pid } of listeners) {
+      const name = processNameFromTasklistCsv(
+        await execAsync(`tasklist /FI "PID eq ${pid}" /FO CSV /NH`),
+      );
+      if (!isAllowedDnsProcess(name)) return { violated: true, process: name, pid, localAddr };
     }
     return { violated: false };
   } catch {
@@ -192,28 +222,43 @@ function checkHostsFile() {
   }
 }
 
+const BATTERY_SCRIPT =
+  '(Get-WmiObject Win32_Battery | Select-Object EstimatedChargeRemaining, BatteryStatus) | ConvertTo-Json';
+
+function parseBatteryState(out) {
+  const b = JSON.parse(out);
+  const state = { percent: b.EstimatedChargeRemaining, onAC: b.BatteryStatus === 2 };
+  logger.info('WATCHDOG', 'Battery', state);
+  return state;
+}
+
 function getBatteryState() {
   try {
-    const out = execSync(
-      'powershell "(Get-WmiObject Win32_Battery | Select-Object EstimatedChargeRemaining, BatteryStatus) | ConvertTo-Json"',
-      { encoding: 'utf8' },
+    return parseBatteryState(
+      execSync(`powershell "${BATTERY_SCRIPT}"`, { encoding: 'utf8' }),
     );
-    const b = JSON.parse(out);
-    const state = { percent: b.EstimatedChargeRemaining, onAC: b.BatteryStatus === 2 };
-    logger.info('WATCHDOG', 'Battery', state);
-    return state;
   } catch {
     logger.info('WATCHDOG', 'Battery: unavailable (desktop or no WMI battery)');
     return { percent: null, onAC: null };
   }
 }
 
-function runFullCheck() {
-  logger.info('WATCHDOG', '——— Full integrity check ———');
-  const dns = dnsModule.verifyDNS();
-  const battery = getBatteryState();
+/** Non-blocking variant of getBatteryState for the read/verify UI path. */
+async function getBatteryStateAsync() {
+  try {
+    return parseBatteryState(await execAsync(`powershell "${BATTERY_SCRIPT}"`));
+  } catch {
+    logger.info('WATCHDOG', 'Battery: unavailable (desktop or no WMI battery)');
+    return { percent: null, onAC: null };
+  }
+}
 
-  const hostsState = checkHostsFile();
+/**
+ * Assemble the integrity-check result from already-gathered probes. Shared by
+ * the sync runFullCheck and the non-blocking runFullCheckAsync so the vector
+ * logic stays identical regardless of how the probes were collected.
+ */
+function buildFullCheckResult({ dns, battery, hostsState, firefoxDoh, chromeDoh, teredoDisabled, rogueDns, unknownVpn }) {
   const probes = dns.probes || [];
   const filterProbe = probes.find((p) => p.label?.includes('CleanBrowsing'));
   if (filterProbe && !filterProbe.blocked) {
@@ -272,12 +317,12 @@ function runFullCheck() {
       violated: !dns.dohConfigured,
       status: healthReport?.status,
     },
-    firefox_doh: checkFirefoxDoH(),
-    chrome_doh: checkChromiumDoH(),
-    ipv6_tunnel: { violated: !dnsModule.verifyTeredoDisabled() },
+    firefox_doh: firefoxDoh,
+    chrome_doh: chromeDoh,
+    ipv6_tunnel: { violated: !teredoDisabled },
     hosts_modified: hostsState,
-    rogue_dns: checkRogueDNS(),
-    unknown_vpn: checkUnknownVpn(),
+    rogue_dns: rogueDns,
+    unknown_vpn: unknownVpn,
   };
 
   for (const [key, result] of Object.entries(vectors)) {
@@ -321,4 +366,50 @@ function runFullCheck() {
   };
 }
 
-module.exports = { runFullCheck, getBatteryState, resetHostsBaseline };
+function runFullCheck() {
+  logger.info('WATCHDOG', '——— Full integrity check ———');
+  return buildFullCheckResult({
+    dns: dnsModule.verifyDNS(),
+    battery: getBatteryState(),
+    hostsState: checkHostsFile(),
+    firefoxDoh: checkFirefoxDoH(),
+    chromeDoh: checkChromiumDoH(),
+    teredoDisabled: dnsModule.verifyTeredoDisabled(),
+    rogueDns: checkRogueDNS(),
+    unknownVpn: checkUnknownVpn(),
+  });
+}
+
+/**
+ * Non-blocking full integrity check for the UI/IPC path. Runs the blocking
+ * probes (verifyDNS, battery, netstat/tasklist, teredo, VPN scan) off the main
+ * thread; fs-based checks (Firefox/Chrome/hosts) stay sync since they are fast.
+ */
+async function runFullCheckAsync() {
+  logger.info('WATCHDOG', '——— Full integrity check (async) ———');
+  const [dns, battery, teredoDisabled, rogueDns, unknownVpn] = await Promise.all([
+    dnsModule.verifyDNSAsync(),
+    getBatteryStateAsync(),
+    dnsModule.verifyTeredoDisabledAsync(),
+    checkRogueDNSAsync(),
+    checkUnknownVpnAsync(),
+  ]);
+  return buildFullCheckResult({
+    dns,
+    battery,
+    hostsState: checkHostsFile(),
+    firefoxDoh: checkFirefoxDoH(),
+    chromeDoh: checkChromiumDoH(),
+    teredoDisabled,
+    rogueDns,
+    unknownVpn,
+  });
+}
+
+module.exports = {
+  runFullCheck,
+  runFullCheckAsync,
+  getBatteryState,
+  getBatteryStateAsync,
+  resetHostsBaseline,
+};

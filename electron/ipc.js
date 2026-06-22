@@ -2,10 +2,13 @@ const { ipcMain } = require('electron');
 
 const logger = require('./logger');
 
-const { verifyDNS } = require('./dns');
-const { getVerifyDnsCached, cacheVectorStatus, getCachedVectorStatus } = require('./dnsStatusCache');
+const {
+  getVerifyDnsCachedAsync,
+  getCachedVectorStatus,
+  getVectorCheckCachedAsync,
+} = require('./dnsStatusCache');
 
-const { runFullCheck, getBatteryState } = require('./watchdog');
+const { getBatteryStateAsync } = require('./watchdog');
 
 const {
   getDnsHealthMonitor,
@@ -208,18 +211,19 @@ ipcMain.handle('get-dns-status', async () => {
 
   const enforcement = getEnforcementStatus();
   const monitor = getDnsHealthMonitor();
-  let health = monitor.getLastReport();
+  const health = monitor.getLastReport();
   const stale = !health || Date.now() - health.timestamp > HEALTH_STALE_MS;
   if (stale && !enforcement.inProgress && !isEnforcementDisabled()) {
-    logger.info('IPC', 'Refreshing stale DNS health report');
-    try {
-      health = await monitor.runHealthCheck('ipc-stale');
-    } catch (e) {
+    // Refresh the health report in the background (DnsHealthMonitor has its own
+    // single-flight guard); never block the IPC reply on it. A 'status-refreshed'
+    // event prompts the renderer to re-fetch once fresh data lands.
+    logger.info('IPC', 'Refreshing stale DNS health report (background)');
+    monitor.runHealthCheck('ipc-stale').catch((e) => {
       logger.warn('IPC', 'Stale health refresh failed', e.message);
-    }
+    });
   }
 
-  const config = getVerifyDnsCached();
+  const config = await getVerifyDnsCachedAsync();
   const lockdown = buildLockdownStatus(
     config,
     {
@@ -264,7 +268,7 @@ ipcMain.handle('get-dns-status', async () => {
 });
 
 ipcMain.handle('get-policy-status', async () => {
-  const config = getVerifyDnsCached();
+  const config = await getVerifyDnsCachedAsync();
   const lockdown = buildLockdownStatus(
     config,
     {
@@ -333,11 +337,14 @@ ipcMain.handle('get-vector-status', async (_event, context = {}) => {
   const stale = !healthReport || Date.now() - healthReport.timestamp > HEALTH_STALE_MS;
 
   if (stale && !enforcement.inProgress && !isEnforcementDisabled()) {
-    await getDnsHealthMonitor().runHealthCheck('ipc-stale').catch(() => {});
+    // Background refresh only — do not block the IPC reply on the health probe.
+    getDnsHealthMonitor().runHealthCheck('ipc-stale').catch(() => {});
   }
 
-  let check = runFullCheck();
-  cacheVectorStatus(check.vectors);
+  // Served from cache instantly when fresh; otherwise the full check runs off
+  // the main thread. Never blocks the event loop on PowerShell/netsh.
+  const check = await getVectorCheckCachedAsync();
+  if (!check) return buildApplyingVectorStatus();
 
   if (check.vectors.unknown_vpn?.violated) {
     check.vectors.unknown_vpn.reportable = false;
@@ -384,7 +391,7 @@ ipcMain.handle('restore-dns', async () => {
   };
 });
 
-ipcMain.handle('get-battery-state', async () => getBatteryState());
+ipcMain.handle('get-battery-state', async () => getBatteryStateAsync());
 
 ipcMain.handle('diagnose-domain', async (_event, payload = {}) => {
   const domain = String(payload.domain || '').trim().toLowerCase();

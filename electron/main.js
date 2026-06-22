@@ -44,15 +44,107 @@ const { getSavedChallengeState } = require('./challengeState');
 
 const { buildMockLockdownResult } = require('./mockEnforcement');
 
+const { startProdServer } = require('./prodServer');
+
 require('./ipc');
 
 
 
 let mainWindow;
 
+let prodServer = null;
+
+let lastLoadedUrl = null;
 
 
-function createWindow() {
+
+const RELOAD_COOLDOWN_MS = 5000;
+
+let lastReloadAt = 0;
+
+
+
+function attemptRecoveryReload(reason) {
+
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+
+  const now = Date.now();
+
+  if (now - lastReloadAt < RELOAD_COOLDOWN_MS) {
+
+    logger.warn('WINDOW', `Skipping reload (cooldown) after ${reason}`);
+
+    return;
+
+  }
+
+  lastReloadAt = now;
+
+  logger.warn('WINDOW', `Auto-reloading renderer after ${reason}`);
+
+  try {
+
+    if (lastLoadedUrl) mainWindow.loadURL(lastLoadedUrl);
+
+    else mainWindow.reload();
+
+  } catch (e) {
+
+    logger.error('WINDOW', 'Auto-reload failed', e.message);
+
+  }
+
+}
+
+
+
+function registerCrashHandlers(win) {
+
+  win.webContents.on('render-process-gone', (_event, details) => {
+
+    logger.error('WINDOW', 'Renderer process gone', details);
+
+    attemptRecoveryReload('render-process-gone');
+
+  });
+
+  win.webContents.on('unresponsive', () => {
+
+    logger.warn('WINDOW', 'Renderer unresponsive');
+
+  });
+
+  win.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+
+    if (!isMainFrame || errorCode === -3 /* ERR_ABORTED */) return;
+
+    logger.error('WINDOW', 'Renderer failed to load', { errorCode, errorDescription, validatedURL });
+
+    attemptRecoveryReload('did-fail-load');
+
+  });
+
+}
+
+
+
+function loadErrorPage(win, message) {
+
+  const html = `<!doctype html><html><head><meta charset="utf-8"/>
+
+<style>body{background:#0a0a0f;color:#e4e4e7;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}</style>
+
+</head><body><div><h2>NetFast couldn't start the app window</h2>
+
+<p style="color:#a1a1aa">${message || 'Unexpected error'}</p></div></body></html>`;
+
+  win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+
+}
+
+
+
+async function createWindow() {
 
   mainWindow = new BrowserWindow({
 
@@ -82,17 +174,49 @@ function createWindow() {
 
 
 
+  registerCrashHandlers(mainWindow);
+
+
+
   const isDev = process.env.NODE_ENV === 'development';
 
-  const devUrl = process.env.VITE_DEV_URL || 'http://localhost:5173';
 
-  isDev
 
-    ? mainWindow.loadURL(devUrl)
+  if (isDev) {
 
-    : mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
+    lastLoadedUrl = process.env.VITE_DEV_URL || 'http://localhost:5173';
 
-  if (isDev) mainWindow.webContents.openDevTools();
+    mainWindow.loadURL(lastLoadedUrl);
+
+    mainWindow.webContents.openDevTools();
+
+    return;
+
+  }
+
+
+
+  // Production: this is a TanStack Start SSR app — serve it from a loopback
+
+  // server and loadURL, instead of loadFile() on a static index.html that does
+
+  // not exist (which is what produced the blank white screen).
+
+  try {
+
+    prodServer = await startProdServer();
+
+    lastLoadedUrl = prodServer.url;
+
+    mainWindow.loadURL(prodServer.url);
+
+  } catch (e) {
+
+    logger.error('STARTUP', 'Failed to start production renderer server', e.message);
+
+    loadErrorPage(mainWindow, 'The app server failed to start. Please reinstall NetFast.');
+
+  }
 
 }
 
@@ -238,7 +362,7 @@ app.whenReady().then(async () => {
   logger.info('STARTUP', 'NetFast Electron ready', { mode: getPolicyMode() });
 
   const windowTimer = createPhaseTimer('window-creation');
-  createWindow();
+  await createWindow();
   windowTimer.end();
 
   const challenge = await getSavedChallengeState();
@@ -254,6 +378,18 @@ app.whenReady().then(async () => {
 
 
 app.on('will-quit', () => {
+
+  if (prodServer) {
+
+    try {
+
+      prodServer.close();
+
+    } catch {}
+
+    prodServer = null;
+
+  }
 
   if (!shouldRunQuitCleanup()) {
 

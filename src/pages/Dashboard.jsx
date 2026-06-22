@@ -101,13 +101,18 @@ export default function Dashboard() {
   useEffect(() => {
     loadAll();
     const id = setInterval(() => refreshVectors(), 30000);
-    const unsubscribe =
+    const unsubscribeEnforcement =
       window.electron?.onEnforcementStatusChanged?.((status) => {
         if (!status.inProgress) refreshVectors();
       }) ?? (() => {});
+    // Background checks in the main process push this when fresh data is ready;
+    // refreshVectors is guarded so the re-fetch is a cheap cache read.
+    const unsubscribeRefreshed =
+      window.electron?.onStatusRefreshed?.(() => refreshVectors()) ?? (() => {});
     return () => {
       clearInterval(id);
-      unsubscribe();
+      unsubscribeEnforcement();
+      unsubscribeRefreshed();
     };
   }, [loadAll, refreshVectors]);
 

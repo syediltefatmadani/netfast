@@ -1,5 +1,28 @@
 const logger = require('./logger');
-const { runEncoded } = require('./powershell');
+const { runEncoded, runEncodedAsync } = require('./powershell');
+
+const LIST_ADAPTERS_SCRIPT = `
+$rows = Get-NetAdapter -ErrorAction SilentlyContinue | ForEach-Object {
+  [PSCustomObject]@{
+    name = $_.Name
+    description = $_.InterfaceDescription
+    status = $_.Status
+    connected = ($_.Status -eq 'Up')
+  }
+}
+$rows | ConvertTo-Json -Compress
+`;
+
+function parseAdapters(out) {
+  const parsed = JSON.parse(out.trim() || '[]');
+  return Array.isArray(parsed) ? parsed : [parsed];
+}
+
+function tunnelAdaptersFrom(adapters) {
+  return adapters
+    .filter((a) => a.connected && isVpnLikeAdapter(a.name, a.description))
+    .map((a) => ({ name: a.name, description: a.description, kind: 'tunnel' }));
+}
 
 /** VPN/tunnel keywords — match name or description (case-insensitive). */
 const VPN_KEYWORDS =
@@ -19,19 +42,16 @@ function isTunnelDescription(description) {
 
 function listAdapters() {
   try {
-    const out = runEncoded(`
-$rows = Get-NetAdapter -ErrorAction SilentlyContinue | ForEach-Object {
-  [PSCustomObject]@{
-    name = $_.Name
-    description = $_.InterfaceDescription
-    status = $_.Status
-    connected = ($_.Status -eq 'Up')
+    return parseAdapters(runEncoded(LIST_ADAPTERS_SCRIPT));
+  } catch (e) {
+    logger.warn('VPN', 'Adapter enumeration failed', e.message);
+    return [];
   }
 }
-$rows | ConvertTo-Json -Compress
-`);
-    const parsed = JSON.parse(out.trim() || '[]');
-    return Array.isArray(parsed) ? parsed : [parsed];
+
+async function listAdaptersAsync() {
+  try {
+    return parseAdapters(await runEncodedAsync(LIST_ADAPTERS_SCRIPT));
   } catch (e) {
     logger.warn('VPN', 'Adapter enumeration failed', e.message);
     return [];
@@ -40,13 +60,11 @@ $rows | ConvertTo-Json -Compress
 
 /** Adapters that look like VPN/tunnel endpoints and are currently up. */
 function getActiveTunnelAdapters() {
-  return listAdapters()
-    .filter((a) => a.connected && isVpnLikeAdapter(a.name, a.description))
-    .map((a) => ({
-      name: a.name,
-      description: a.description,
-      kind: 'tunnel',
-    }));
+  return tunnelAdaptersFrom(listAdapters());
+}
+
+async function getActiveTunnelAdaptersAsync() {
+  return tunnelAdaptersFrom(await listAdaptersAsync());
 }
 
 /**
@@ -55,8 +73,12 @@ function getActiveTunnelAdapters() {
  */
 function checkUnknownVpn() {
   const adapters = getActiveTunnelAdapters();
-  const violated = adapters.length > 0;
-  return { violated, adapters };
+  return { violated: adapters.length > 0, adapters };
+}
+
+async function checkUnknownVpnAsync() {
+  const adapters = await getActiveTunnelAdaptersAsync();
+  return { violated: adapters.length > 0, adapters };
 }
 
 module.exports = {
@@ -64,6 +86,9 @@ module.exports = {
   isVpnLikeAdapter,
   isTunnelDescription,
   listAdapters,
+  listAdaptersAsync,
   getActiveTunnelAdapters,
+  getActiveTunnelAdaptersAsync,
   checkUnknownVpn,
+  checkUnknownVpnAsync,
 };

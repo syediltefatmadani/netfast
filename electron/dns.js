@@ -1,16 +1,21 @@
 const { execSync } = require('child_process');
 const logger = require('./logger');
-const { runEncoded } = require('./powershell');
+const { runEncoded, runEncodedAsync } = require('./powershell');
+const { execAsync } = require('./asyncExec');
 const { assertRealEnforcementAllowed, isRealEnforcementAllowed } = require('./enforcementGuard');
 const { getMockDnsApplyResult, getMockVerifyDnsResult } = require('./mockEnforcement');
-const { verifyFirewall } = require('./firewall');
+const { verifyFirewall, verifyFirewallAsync } = require('./firewall');
 const { applyMongoNrptRules } = require('./mongoDns');
 const { DNS, ALLOWED_IPV4_DNS, ALLOWED_IPV6_DNS } = require('./dnsConstants');
 const {
   getActiveAdapters,
   applyNetworkEnforcement,
 } = require('./networkEnforcement');
-const { runFunctionalDnsVerification, invalidateFunctionalDnsCache } = require('./functionalDnsVerification');
+const {
+  runFunctionalDnsVerification,
+  runFunctionalDnsVerificationAsync,
+  invalidateFunctionalDnsCache,
+} = require('./functionalDnsVerification');
 
 function run(cmd, tag) {
   logger.info(tag, `> ${cmd}`);
@@ -150,27 +155,7 @@ function buildDnsAuditFromInterfaces(interfaces, enforcementTargetRows) {
   };
 }
 
-/** Per-interface DNS + rogue servers (e.g. router 10.x pushed by DHCP). */
-function getDnsAudit() {
-  try {
-    const {
-      getEnforcementTargetAdapters,
-      findAdaptersWithRogueDns,
-      getCachedAdapterScan,
-    } = require('./networkEnforcement');
-
-    const cachedTargets = getCachedAdapterScan();
-    if (cachedTargets?.length) {
-      const interfaces = cachedTargets.map((a) => ({
-        name: a.interfaceAlias,
-        status: a.status,
-        ipv4: a.ipv4Dns || [],
-        ipv6: a.ipv6Dns || [],
-      }));
-      return buildDnsAuditFromInterfaces(interfaces, cachedTargets);
-    }
-
-    const out = runEncoded(`
+const DNS_AUDIT_SCRIPT = `
 $adapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
   $_.InterfaceDescription -notmatch 'Loopback|Software Loopback|Microsoft Loopback' -and
   $_.Name -notmatch 'Loopback'
@@ -181,22 +166,64 @@ $rows = foreach ($a in $adapters) {
   [PSCustomObject]@{ name = $a.Name; status = $a.Status; ipv4 = @($v4); ipv6 = @($v6) }
 }
 $rows | ConvertTo-Json -Compress
-`);
+`;
+
+function dnsAuditFromCachedTargets() {
+  const { getCachedAdapterScan } = require('./networkEnforcement');
+  const cachedTargets = getCachedAdapterScan();
+  if (!cachedTargets?.length) return null;
+  const interfaces = cachedTargets.map((a) => ({
+    name: a.interfaceAlias,
+    status: a.status,
+    ipv4: a.ipv4Dns || [],
+    ipv6: a.ipv6Dns || [],
+  }));
+  return buildDnsAuditFromInterfaces(interfaces, cachedTargets);
+}
+
+function emptyDnsAudit() {
+  return {
+    intact: false,
+    ipv4Locked: false,
+    ipv6Locked: false,
+    rogue: [],
+    rogueServers: [],
+    interfaces: [],
+    connected: [],
+  };
+}
+
+/** Per-interface DNS + rogue servers (e.g. router 10.x pushed by DHCP). */
+function getDnsAudit() {
+  try {
+    const cached = dnsAuditFromCachedTargets();
+    if (cached) return cached;
+
+    const { getEnforcementTargetAdapters } = require('./networkEnforcement');
+    const out = runEncoded(DNS_AUDIT_SCRIPT);
     const parsed = JSON.parse(out.trim() || '[]');
     const interfaces = Array.isArray(parsed) ? parsed : [parsed];
-    const enforcementTargets = getEnforcementTargetAdapters();
-    return buildDnsAuditFromInterfaces(interfaces, enforcementTargets);
+    return buildDnsAuditFromInterfaces(interfaces, getEnforcementTargetAdapters());
   } catch (e) {
     logger.execError('DNS', 'DNS audit failed', e);
-    return {
-      intact: false,
-      ipv4Locked: false,
-      ipv6Locked: false,
-      rogue: [],
-      rogueServers: [],
-      interfaces: [],
-      connected: [],
-    };
+    return emptyDnsAudit();
+  }
+}
+
+/** Non-blocking variant of getDnsAudit for the read/verify UI path. */
+async function getDnsAuditAsync() {
+  try {
+    const cached = dnsAuditFromCachedTargets();
+    if (cached) return cached;
+
+    const { getEnforcementTargetAdapters } = require('./networkEnforcement');
+    const out = await runEncodedAsync(DNS_AUDIT_SCRIPT);
+    const parsed = JSON.parse(out.trim() || '[]');
+    const interfaces = Array.isArray(parsed) ? parsed : [parsed];
+    return buildDnsAuditFromInterfaces(interfaces, getEnforcementTargetAdapters());
+  } catch (e) {
+    logger.execError('DNS', 'DNS audit failed', e);
+    return emptyDnsAudit();
   }
 }
 
@@ -381,10 +408,7 @@ try {
   return runEncoded(script);
 }
 
-function checkDoHConfig() {
-  if (!isRealEnforcementAllowed('checkDoHConfig')) return true;
-  try {
-    const out = runEncoded(`
+const DOH_CONFIG_CHECK_SCRIPT = `
 $doh = Get-DnsClientDohServerAddress -ErrorAction SilentlyContinue | Where-Object { $_.ServerAddress -in @('${DNS.ipv4.primary}', '${DNS.ipv4.secondary}', '${DNS.ipv6.primary}', '${DNS.ipv6.secondary}') }
 $reg = (Get-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Dnscache\\Parameters' -Name 'EnableAutoDoh' -ErrorAction SilentlyContinue).EnableAutoDoh
 $required = @('${DNS.ipv4.primary}', '${DNS.ipv4.secondary}')
@@ -398,8 +422,12 @@ foreach ($d in $doh) {
 }
 if ($reg -ne 2) { $ok = $false }
 [PSCustomObject]@{ ok = $ok; count = $doh.Count; reg = $reg } | ConvertTo-Json -Compress
-`);
-    const parsed = JSON.parse(out.trim());
+`;
+
+function checkDoHConfig() {
+  if (!isRealEnforcementAllowed('checkDoHConfig')) return true;
+  try {
+    const parsed = JSON.parse(runEncoded(DOH_CONFIG_CHECK_SCRIPT).trim());
     return parsed.ok === true;
   } catch (e) {
     logger.execError('DNS', 'DoH config check failed', e);
@@ -407,25 +435,53 @@ if ($reg -ne 2) { $ok = $false }
   }
 }
 
-function verifyDNS() {
-  if (!isRealEnforcementAllowed('verifyDNS')) {
-    return getMockVerifyDnsResult();
-  }
+/** Non-blocking variant of checkDoHConfig for the read/verify UI path. */
+async function checkDoHConfigAsync() {
+  if (!isRealEnforcementAllowed('checkDoHConfig')) return true;
   try {
-    const audit = getDnsAudit();
-    const dohConfigured = checkDoHConfig();
-    const fw = verifyFirewall();
-    const firewallLocked = fw.firewallLocked;
-    let strictMode = false;
-    try {
-      const { loadBackup } = require('./networkEnforcement');
-      strictMode = Boolean(loadBackup()?.strictMode);
-    } catch {
-      /* optional */
-    }
-    const ipv4ConfigLocked = audit.ipv4Locked;
+    const parsed = JSON.parse((await runEncodedAsync(DOH_CONFIG_CHECK_SCRIPT)).trim());
+    return parsed.ok === true;
+  } catch (e) {
+    logger.execError('DNS', 'DoH config check failed', e);
+    return false;
+  }
+}
+
+function loadStrictMode() {
+  try {
+    const { loadBackup } = require('./networkEnforcement');
+    return Boolean(loadBackup()?.strictMode);
+  } catch {
+    return false;
+  }
+}
+
+function verifyDnsFailureResult() {
+  return {
+    dnsApplied: false,
+    ipv4Locked: false,
+    ipv6Locked: false,
+    functionalDnsProtection: false,
+    blockedDomainTests: [],
+    firewallLocked: false,
+    rogueServers: [],
+    dnsIntegrity: false,
+    dohConfigured: false,
+    firewallIntact: false,
+    rogueDns: [],
+    filteringActive: false,
+    blockedDomains: [],
+    unblockedDomains: [],
+    ipv4: { intact: false },
+    ipv6: { intact: false },
+  };
+}
+
+/** Assemble the verifyDNS result from already-gathered checks (sync + async share this). */
+function buildVerifyDnsResult({ audit, dohConfigured, fw, functional, strictMode }) {
+  const firewallLocked = fw.firewallLocked;
+  const ipv4ConfigLocked = audit.ipv4Locked;
     const ipv6ConfigLocked = strictMode ? ipv4ConfigLocked : audit.ipv6Locked;
-    const functional = runFunctionalDnsVerification({ timeoutSec: 8 });
     const functionalDnsProtection = functional.functionalDnsProtection;
     const dnsApplied = functionalDnsProtection;
     const rogueServers = audit.rogueServers;
@@ -509,26 +565,46 @@ function verifyDNS() {
       rogueCount: rogueServers.length,
     });
     return result;
+}
+
+function verifyDNS() {
+  if (!isRealEnforcementAllowed('verifyDNS')) {
+    return getMockVerifyDnsResult();
+  }
+  try {
+    return buildVerifyDnsResult({
+      audit: getDnsAudit(),
+      dohConfigured: checkDoHConfig(),
+      fw: verifyFirewall(),
+      functional: runFunctionalDnsVerification({ timeoutSec: 8 }),
+      strictMode: loadStrictMode(),
+    });
   } catch (e) {
     logger.execError('DNS', 'Verify DNS failed', e);
-    return {
-      dnsApplied: false,
-      ipv4Locked: false,
-      ipv6Locked: false,
-      functionalDnsProtection: false,
-      blockedDomainTests: [],
-      firewallLocked: false,
-      rogueServers: [],
-      dnsIntegrity: false,
-      dohConfigured: false,
-      firewallIntact: false,
-      rogueDns: [],
-      filteringActive: false,
-      blockedDomains: [],
-      unblockedDomains: [],
-      ipv4: { intact: false },
-      ipv6: { intact: false },
-    };
+    return verifyDnsFailureResult();
+  }
+}
+
+/**
+ * Non-blocking verifyDNS for the read/verify UI path. Runs the audit, DoH check,
+ * firewall verify, and functional probes off the main thread (in parallel where
+ * independent). Returns the identical result shape as verifyDNS.
+ */
+async function verifyDNSAsync() {
+  if (!isRealEnforcementAllowed('verifyDNS')) {
+    return getMockVerifyDnsResult();
+  }
+  try {
+    const [audit, dohConfigured, fw, functional] = await Promise.all([
+      getDnsAuditAsync(),
+      checkDoHConfigAsync(),
+      verifyFirewallAsync(),
+      runFunctionalDnsVerificationAsync({ timeoutSec: 8 }),
+    ]);
+    return buildVerifyDnsResult({ audit, dohConfigured, fw, functional, strictMode: loadStrictMode() });
+  } catch (e) {
+    logger.execError('DNS', 'Verify DNS failed', e);
+    return verifyDnsFailureResult();
   }
 }
 
@@ -564,14 +640,31 @@ function verifyTeredoDisabled() {
   }
 }
 
+/** Non-blocking variant of verifyTeredoDisabled for the read/verify UI path. */
+async function verifyTeredoDisabledAsync() {
+  try {
+    const out = await execAsync('netsh interface teredo show state');
+    const disabled = out.toLowerCase().includes('disabled');
+    logger.info('TUNNEL', 'Teredo state', { disabled, snippet: out.trim().split('\n')[0] });
+    return disabled;
+  } catch (e) {
+    logger.execError('TUNNEL', 'Teredo verify failed', e);
+    return false;
+  }
+}
+
 module.exports = {
   applyDNS,
   verifyDNS,
+  verifyDNSAsync,
   getDnsAudit,
+  getDnsAuditAsync,
   disableIPv6Tunneling,
   verifyTeredoDisabled,
+  verifyTeredoDisabledAsync,
   configureWindowsDoH,
   checkDoHConfig,
+  checkDoHConfigAsync,
   invalidateFunctionalDnsCache,
   DNS,
   ALLOWED_IPV4_DNS,

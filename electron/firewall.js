@@ -17,7 +17,9 @@ const {
   applyRawDnsBlockRules,
   removeRawDnsBlockRules,
   verifyRawDnsBlockRules,
+  verifyRawDnsBlockRulesAsync,
 } = require('./dnsBypassFirewall');
+const { execAsync } = require('./asyncExec');
 const { isDeveloperLikeMode } = require('./policyMode');
 
 const RULE_PREFIX = 'NetFast-DNS-';
@@ -181,13 +183,27 @@ function createFirewallRule({ name, dir, action, protocol, remoteip, remoteport,
   return res;
 }
 
+function parseOurRules(out) {
+  return out
+    .split('\n')
+    .filter((line) => line.includes('Rule Name:') && line.includes('NetFast'))
+    .map((line) => line.replace('Rule Name:', '').trim());
+}
+
 function listOurRules() {
   try {
     const out = execSync('netsh advfirewall firewall show rule name=all', { encoding: 'utf8' });
-    return out
-      .split('\n')
-      .filter((line) => line.includes('Rule Name:') && line.includes('NetFast'))
-      .map((line) => line.replace('Rule Name:', '').trim());
+    return parseOurRules(out);
+  } catch {
+    return [];
+  }
+}
+
+/** Non-blocking variant of listOurRules for the read/verify UI path. */
+async function listOurRulesAsync() {
+  try {
+    const out = await execAsync('netsh advfirewall firewall show rule name=all');
+    return parseOurRules(out);
   } catch {
     return [];
   }
@@ -609,10 +625,62 @@ function verifyFirewall() {
   }
 }
 
+/** Non-blocking variant of verifyFirewall — same logic, async netsh reads. */
+async function verifyFirewallAsync() {
+  try {
+    initResolversAndRules();
+    const [rules, rawDnsVerify] = await Promise.all([
+      listOurRulesAsync(),
+      verifyRawDnsBlockRulesAsync(),
+    ]);
+    const activeRules = new Set(rules);
+    const hasGlobalBlock = [...activeRules].some(
+      (n) => n.includes('Block-UDP-53-Other') || n.includes('Block-TCP-53-Other'),
+    );
+    const missingCore = EXPECTED_CORE_RULES.filter((r) => !activeRules.has(r));
+    const missingBypass = EXPECTED_BYPASS_RULES.filter((r) => !activeRules.has(r));
+    const firewallCoreLocked = missingCore.length === 0;
+    const bypassResolversBlocked = missingBypass.length === 0 && !hasGlobalBlock;
+    const rawDnsBypassBlocked = rawDnsVerify.allEnabled;
+    const firewallLocked = firewallCoreLocked && bypassResolversBlocked && rawDnsBypassBlocked;
+    if (!firewallLocked) {
+      logger.warn('FIREWALL', 'Firewall verification failed', {
+        missingCore,
+        missingBypass,
+        hasGlobalBlock,
+        rawDnsVerify,
+      });
+    }
+    return {
+      firewallLocked,
+      firewallCoreLocked,
+      bypassResolversBlocked,
+      rawDnsBypassBlocked,
+      hasGlobalBlock,
+      missingCore,
+      missingBypass,
+      rawDnsVerify,
+    };
+  } catch (e) {
+    logger.execError('FIREWALL', 'Firewall verification failed', e);
+    return {
+      firewallLocked: false,
+      firewallCoreLocked: false,
+      bypassResolversBlocked: false,
+      rawDnsBypassBlocked: false,
+      hasGlobalBlock: false,
+      missingCore: [],
+      missingBypass: [],
+      rawDnsVerify: { allEnabled: false, missing: [], disabled: [] },
+    };
+  }
+}
+
 module.exports = {
   applyDnsFirewall,
   removeDnsFirewall,
   verifyFirewall,
+  verifyFirewallAsync,
   createFirewallRule,
   ensureFirewallRule,
   removeStaleFirewallRules,

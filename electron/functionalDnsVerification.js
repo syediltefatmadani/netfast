@@ -1,6 +1,6 @@
 const logger = require('./logger');
+const { resolveDnsName, resolveDnsNameAsync } = require('./dnsResolve');
 const {
-  resolveDnsName,
   isBlockedARecord,
   isBlockedAAAARecord,
   isRealPublicIpv4,
@@ -82,6 +82,10 @@ function runFunctionalDnsVerification({ timeoutSec = 8, domains = FUNCTIONAL_BLO
     blockedDomainTests.push(classifyBlockedDomainTest(domain, resolveResult));
   }
 
+  return buildFunctionalResult(blockedDomainTests);
+}
+
+function buildFunctionalResult(blockedDomainTests) {
   const functionalDnsProtection =
     blockedDomainTests.length > 0 && blockedDomainTests.every((t) => t.blocked);
 
@@ -102,6 +106,25 @@ function runFunctionalDnsVerification({ timeoutSec = 8, domains = FUNCTIONAL_BLO
   return result;
 }
 
+/** Non-blocking variant — resolves the probe domains off the main thread. */
+async function runFunctionalDnsVerificationAsync({
+  timeoutSec = 8,
+  domains = FUNCTIONAL_BLOCKED_DOMAINS,
+  force = false,
+} = {}) {
+  if (!force && cachedResult && Date.now() - cachedAt < CACHE_MS) {
+    return cachedResult;
+  }
+
+  const blockedDomainTests = [];
+  for (const domain of domains) {
+    const resolveResult = await resolveDnsNameAsync(domain, { timeoutSec });
+    blockedDomainTests.push(classifyBlockedDomainTest(domain, resolveResult));
+  }
+
+  return buildFunctionalResult(blockedDomainTests);
+}
+
 function invalidateFunctionalDnsCache() {
   cachedResult = null;
   cachedAt = 0;
@@ -111,5 +134,6 @@ module.exports = {
   FUNCTIONAL_BLOCKED_DOMAINS,
   classifyBlockedDomainTest,
   runFunctionalDnsVerification,
+  runFunctionalDnsVerificationAsync,
   invalidateFunctionalDnsCache,
 };

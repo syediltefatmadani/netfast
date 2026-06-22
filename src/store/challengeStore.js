@@ -13,6 +13,7 @@ export const useChallengeStore = create((set, get) => ({
   lastCheckedAt: null,
   reapplyLoading: false,
   reapplyError: null,
+  _vectorsInFlight: false,
 
   loadAll: async (challengeId) => {
     const id = challengeId || localStorage.getItem('fl_challenge_id');
@@ -43,15 +44,23 @@ export const useChallengeStore = create((set, get) => ({
   },
 
   refreshVectors: async () => {
-    const id = get().challenge?._id || localStorage.getItem('fl_challenge_id');
-    const context = buildVpnContext(id);
-    const [vectorStatus, dnsStatus, vpnRuntime] = await Promise.all([
-      electronBridge.getVectorStatus(context),
-      electronBridge.getDNSStatus(),
-      electronBridge.getVpnChallengeState(context),
-    ]);
-    if (id) await get().syncVpnBackendReport(id, vpnRuntime);
-    set({ vectorStatus, dnsStatus, vpnRuntime, lastCheckedAt: Date.now() });
+    // Guard against overlapping refreshes: the 30s interval, the enforcement
+    // listener, and the status-refreshed push can all fire close together.
+    if (get()._vectorsInFlight) return;
+    set({ _vectorsInFlight: true });
+    try {
+      const id = get().challenge?._id || localStorage.getItem('fl_challenge_id');
+      const context = buildVpnContext(id);
+      const [vectorStatus, dnsStatus, vpnRuntime] = await Promise.all([
+        electronBridge.getVectorStatus(context),
+        electronBridge.getDNSStatus(),
+        electronBridge.getVpnChallengeState(context),
+      ]);
+      if (id) await get().syncVpnBackendReport(id, vpnRuntime);
+      set({ vectorStatus, dnsStatus, vpnRuntime, lastCheckedAt: Date.now() });
+    } finally {
+      set({ _vectorsInFlight: false });
+    }
   },
 
   syncVpnBackendReport: async (challengeId, vpnRuntime) => {

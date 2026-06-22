@@ -3,6 +3,7 @@ const { ipcMain } = require('electron');
 const logger = require('./logger');
 
 const { verifyDNS } = require('./dns');
+const { getVerifyDnsCached, cacheVectorStatus, getCachedVectorStatus } = require('./dnsStatusCache');
 
 const { runFullCheck, getBatteryState } = require('./watchdog');
 
@@ -39,6 +40,24 @@ const GAP_MS = 2 * 60 * 1000;
 
 const HEALTH_STALE_MS = 120000;
 
+function buildApplyingVectorStatus() {
+  const ok = (key) => ({ violated: false, warnings: 0, applying: true, vector: key });
+  return {
+    dns_filtering: ok('dns_filtering'),
+    dns_provider_miss: { violated: false, warning: false, applying: true },
+    fallback_blocking: ok('fallback_blocking'),
+    dns_ipv4: ok('dns_ipv4'),
+    dns_ipv6: ok('dns_ipv6'),
+    windows_doh: ok('windows_doh'),
+    firefox_doh: ok('firefox_doh'),
+    chrome_doh: ok('chrome_doh'),
+    ipv6_tunnel: ok('ipv6_tunnel'),
+    hosts_modified: ok('hosts_modified'),
+    rogue_dns: ok('rogue_dns'),
+    unknown_vpn: ok('unknown_vpn'),
+  };
+}
+
 function buildProtectionUiStatus(config, health) {
   const mode = config.mode || getPolicyMode();
 
@@ -70,14 +89,21 @@ function buildProtectionUiStatus(config, health) {
   const warnings = [];
   const errors = [];
 
-  if (!config.ipv4Locked) warnings.push('IPv4 DNS is not locked to CleanBrowsing');
-  if (!config.ipv6Locked) warnings.push('IPv6 DNS is not locked to CleanBrowsing');
+  if (!config.ipv4Locked) {
+    warnings.push('Adapter IPv4 DNS is not set to CleanBrowsing (informational)');
+  }
+  if (!config.ipv6Locked) {
+    warnings.push('Adapter IPv6 DNS is not set to CleanBrowsing (informational)');
+  }
+  if (!config.functionalDnsProtection) {
+    errors.push('DNS filtering not active — blocked domains are resolving');
+  }
   if (!config.firewallLocked) {
     errors.push(config.error || 'DNS firewall is not fully locked');
   }
   if ((config.rogueServers || []).length > 0) {
     warnings.push(
-      `Rogue DNS server(s) detected: ${config.rogueServers.map((r) => r.server).join(', ')}`,
+      `Non-CleanBrowsing DNS on adapter(s): ${config.rogueServers.map((r) => r.server).join(', ')}`,
     );
   }
   if (!config.dohConfigured) warnings.push('Windows DoH is not configured for CleanBrowsing');
@@ -108,7 +134,6 @@ function buildProtectionUiStatus(config, health) {
     warnings.push(`MongoDB SRV lookup failed: ${mongoDiag.error || 'querySrv timeout'}`);
   }
 
-  const filteringOk = health ? isProtectionActive(health.status) : false;
   if (health?.providerMisses?.length) {
     warnings.push(
       `CleanBrowsing provider miss on: ${health.providerMisses.join(', ')} (local fallback active)`,
@@ -117,13 +142,15 @@ function buildProtectionUiStatus(config, health) {
   if (health?.finalStatus === 'healthy_with_provider_misses') {
     warnings.push('DoH primary working; provider misses caught by fallback');
   }
-  const dnsLocked = config.dnsApplied && config.ipv4Locked && config.ipv6Locked;
+  const filteringOk =
+    config.functionalDnsProtection === true ||
+    (health ? isProtectionActive(health.status) : false);
+  const dnsLocked = config.functionalDnsProtection === true;
   const coreOk =
     dnsLocked &&
     config.firewallLocked &&
     config.firewallCoreLocked &&
-    config.bypassResolversBlocked !== false &&
-    (config.rogueServers || []).length === 0;
+    config.bypassResolversBlocked !== false;
 
   let protectionState = 'inactive';
   const devProtected =
@@ -163,6 +190,8 @@ function buildProtectionUiStatus(config, health) {
     developerExceptionsApplied: Boolean(config.developerExceptionsApplied),
     dockerProtected: config.dockerProtected ?? 'unknown',
     wslProtected: config.wslProtected ?? 'unknown',
+    functionalDnsProtection: config.functionalDnsProtection,
+    blockedDomainTests: config.blockedDomainTests || [],
   };
 }
 
@@ -181,7 +210,7 @@ ipcMain.handle('get-dns-status', async () => {
   const monitor = getDnsHealthMonitor();
   let health = monitor.getLastReport();
   const stale = !health || Date.now() - health.timestamp > HEALTH_STALE_MS;
-  if (stale) {
+  if (stale && !enforcement.inProgress && !isEnforcementDisabled()) {
     logger.info('IPC', 'Refreshing stale DNS health report');
     try {
       health = await monitor.runHealthCheck('ipc-stale');
@@ -190,7 +219,7 @@ ipcMain.handle('get-dns-status', async () => {
     }
   }
 
-  const config = verifyDNS();
+  const config = getVerifyDnsCached();
   const lockdown = buildLockdownStatus(
     config,
     {
@@ -235,7 +264,7 @@ ipcMain.handle('get-dns-status', async () => {
 });
 
 ipcMain.handle('get-policy-status', async () => {
-  const config = verifyDNS();
+  const config = getVerifyDnsCached();
   const lockdown = buildLockdownStatus(
     config,
     {
@@ -293,28 +322,31 @@ ipcMain.handle('get-vector-status', async (_event, context = {}) => {
   logger.info('IPC', 'get-vector-status');
   processVpnCheck(context);
 
+  const enforcement = getEnforcementStatus();
+  if (enforcement.inProgress) {
+    const cached = getCachedVectorStatus();
+    if (cached) return cached;
+    return buildApplyingVectorStatus();
+  }
+
   const healthReport = getDnsHealthMonitor().getLastReport();
   const stale = !healthReport || Date.now() - healthReport.timestamp > HEALTH_STALE_MS;
 
-  if (stale && !isEnforcementDisabled()) {
+  if (stale && !enforcement.inProgress && !isEnforcementDisabled()) {
     await getDnsHealthMonitor().runHealthCheck('ipc-stale').catch(() => {});
   }
 
   let check = runFullCheck();
+  cacheVectorStatus(check.vectors);
 
   if (check.vectors.unknown_vpn?.violated) {
     check.vectors.unknown_vpn.reportable = false;
     check.vectors.unknown_vpn.vpnHandlerManaged = true;
   }
 
-  const configViolated =
-    check.vectors.dns_ipv4.violated ||
-    check.vectors.dns_ipv6.violated ||
-    check.vectors.windows_doh?.violated;
-
   const filteringViolated =
     check.vectors.dns_filtering?.violated || check.dnsHealth?.status === DnsStatus.FAILED;
-  const dnsViolated = configViolated || filteringViolated;
+  const dnsViolated = filteringViolated;
 
   if (isEnforcementDisabled()) {
     return check.vectors;
@@ -323,15 +355,10 @@ ipcMain.handle('get-vector-status', async (_event, context = {}) => {
   if (dnsViolated && shouldAttemptRestore(check.dnsHealth?.status) && isRealEnforcementAllowed('ipc-auto-restore')) {
     if (!dnsGapStart) {
       dnsGapStart = Date.now();
-      const reason = configViolated ? 'dns-hijacked' : 'filtering-inactive';
+      const reason = 'filtering-inactive';
       logger.warn('IPC', `DNS protection inactive — attempting restore (reason: ${reason})`);
       await runLockdown(reason);
     } else if (Date.now() - dnsGapStart > GAP_MS) {
-      if (configViolated) {
-        check.vectors.dns_ipv4.reportable = true;
-        check.vectors.dns_ipv6.reportable = true;
-        if (check.vectors.windows_doh) check.vectors.windows_doh.reportable = true;
-      }
       if (filteringViolated) {
         check.vectors.dns_filtering.reportable = true;
       }

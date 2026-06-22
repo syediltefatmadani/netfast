@@ -2,16 +2,14 @@ const logger = require('./logger');
 const { runEncoded } = require('./powershell');
 const dnsModule = require('./dns');
 const { getDnsHealthMonitor } = require('./services/dns');
-const { flushDnsCache } = require('./hosts');
 const {
   getAdapterFingerprint,
-  runFullEnforcementVerification,
   isAdapterStateCompliant,
 } = require('./networkEnforcement');
 const { refreshRawDnsBlockRules } = require('./dnsBypassFirewall');
-const { applyChromiumCleanBrowsingDoH, getChromiumDoHPolicyStatus } = require('./browserPolicy');
-const { applyDnsFirewall, verifyFirewall, ADMIN_PRIVILEGE_MESSAGE } = require('./firewall');
-const { createPhaseTimer, timedPhase } = require('./startupTiming');
+const { getChromiumDoHPolicyStatus } = require('./browserPolicy');
+const { verifyFirewall, ADMIN_PRIVILEGE_MESSAGE } = require('./firewall');
+const { createPhaseTimer } = require('./startupTiming');
 const { isRealEnforcementAllowed, markRealEnforcementApplied } = require('./enforcementGuard');
 const { buildMockLockdownResult } = require('./mockEnforcement');
 const { refreshRuntimeExemptions } = require('./processExclusions');
@@ -25,30 +23,16 @@ const {
   logPolicyModeStartup,
   buildPolicyStatusSnapshot,
 } = require('./policyMode');
-const { runDockerWslDiagnostics } = require('./dockerWslDetect');
-const { validateDeveloperMode } = require('./developerValidation');
 const {
-  syncAtlasHostsFromDoh,
-  runMongoDnsDiagnostic,
-  discoverMongoHostsFromEnvFiles,
   isHostsFallbackEnabled,
-  clearAtlasHostsBlock,
   getLastMongoDiagnostic,
 } = require('./mongoDns');
-const { resetHostsBaseline } = require('./watchdog');
+const { runLockdownInWorker } = require('./lockdownRunner');
+const { invalidateDnsStatusCache, getVerifyDnsCached } = require('./dnsStatusCache');
 
-function useHostsBlocklist() {
-  const v = (process.env.NETFAST_HOSTS_BLOCK ?? '1').toLowerCase();
-  return v !== '0' && v !== 'false' && v !== 'no';
-}
-
-function syncHostsIfEnabled() {
-  if (!useHostsBlocklist()) return { ok: true, skipped: true };
-  const { syncHostsBlocklist } = require('./hosts');
-  const hosts = syncHostsBlocklist();
-  if (hosts.ok) resetHostsBaseline();
-  return hosts;
-}
+let activeLockdown = null;
+let lastWatchLockdownAt = 0;
+const WATCH_LOCKDOWN_COOLDOWN_MS = 60000;
 
 function getNetworkFingerprint() {
   try {
@@ -106,10 +90,16 @@ function buildLockdownStatus(dns, firewall, audit, extras = {}) {
     optionalWarnings.push(dns.nrptError);
   }
 
-  const dnsApplied = Boolean(dns?.dnsApplied ?? (audit?.ipv4Locked && (audit?.ipv6Locked || dns?.strictMode)));
-  const ipv4Locked = Boolean(audit?.ipv4Locked ?? dns?.ipv4Locked);
-  const ipv6Locked = Boolean(dns?.strictMode ? audit?.ipv4Locked : (audit?.ipv6Locked ?? dns?.ipv6Locked));
+  const ipv4ConfigLocked = Boolean(audit?.ipv4Locked ?? dns?.ipv4Locked ?? dns?.ipv4ConfigLocked);
+  const ipv6ConfigLocked = Boolean(
+    dns?.strictMode ? audit?.ipv4Locked : (audit?.ipv6Locked ?? dns?.ipv6Locked ?? dns?.ipv6ConfigLocked),
+  );
   const strictMode = Boolean(dns?.strictMode ?? dns?.enforcement?.strictMode);
+  const functionalDnsProtection = Boolean(
+    dns?.functionalDnsProtection ?? dns?.functionalVerification?.functionalDnsProtection,
+  );
+  const blockedDomainTests =
+    dns?.blockedDomainTests || dns?.functionalVerification?.blockedDomainTests || [];
   const dohConfigured = Boolean(dns?.dohConfigured ?? dns?.doh?.ok);
   const firewallCoreLocked = Boolean(firewall?.firewallCoreLocked);
   const bypassResolversBlocked = Boolean(firewall?.bypassResolversBlocked);
@@ -117,9 +107,11 @@ function buildLockdownStatus(dns, firewall, audit, extras = {}) {
   const firewallLocked = Boolean(firewall?.firewallLocked);
   const rogueServers = audit?.rogueServers || dns?.rogueServers || [];
 
-  const dnsIntegrity =
-    dns?.dnsIntegrity ??
-    (dnsApplied && dohConfigured && firewallLocked && rogueServers.length === 0);
+  // Authoritative: functional filtering behavior. Config fields are informational.
+  const dnsApplied = functionalDnsProtection;
+  const ipv4Locked = ipv4ConfigLocked;
+  const ipv6Locked = ipv6ConfigLocked;
+  const dnsIntegrity = functionalDnsProtection && firewallLocked;
 
   const browserDoh = extras.browserDoh || getChromiumDoHPolicyStatus();
   const dockerWsl = extras.dockerWsl || null;
@@ -131,6 +123,10 @@ function buildLockdownStatus(dns, firewall, audit, extras = {}) {
     dnsApplied,
     ipv4Locked,
     ipv6Locked,
+    ipv4ConfigLocked,
+    ipv6ConfigLocked,
+    functionalDnsProtection,
+    blockedDomainTests,
     strictMode,
     dnsIntegrity,
     dohConfigured,
@@ -161,12 +157,27 @@ function buildLockdownStatus(dns, firewall, audit, extras = {}) {
   if (!lockStatus.firewallLocked && firewall?.adminRequired) {
     lockStatus.error = ADMIN_PRIVILEGE_MESSAGE;
     errors.push(lockStatus.error);
-  } else if (!lockStatus.dnsApplied) {
-    lockStatus.error = 'DNS lock incomplete — IPv4 and IPv6 must both use CleanBrowsing servers';
+  } else if (!functionalDnsProtection) {
+    lockStatus.error = 'DNS filtering not active — blocked domains are resolving';
     errors.push(lockStatus.error);
   } else if (!lockStatus.firewallLocked) {
     lockStatus.error = firewall?.error || 'DNS firewall lock incomplete';
     errors.push(lockStatus.error);
+  }
+
+  if (!ipv4ConfigLocked) {
+    warnings.push('Adapter IPv4 DNS is not set to CleanBrowsing (filtering may use forwarded DoH)');
+  }
+  if (!ipv6ConfigLocked && !strictMode) {
+    warnings.push('Adapter IPv6 DNS is not set to CleanBrowsing (informational)');
+  }
+  if (rogueServers.length > 0) {
+    warnings.push(
+      `Non-CleanBrowsing DNS on adapter(s): ${rogueServers.map((r) => r.server).join(', ')}`,
+    );
+  }
+  if (!dohConfigured) {
+    warnings.push('Windows DoH is not configured for CleanBrowsing');
   }
 
   if (optionalWarnings.length) {
@@ -199,7 +210,7 @@ function buildLockdownStatus(dns, firewall, audit, extras = {}) {
   const healthWarnings =
     healthReport?.hasWarnings || healthReport?.finalStatus === 'healthy_with_provider_misses';
 
-  const lockdownOk = lockStatus.dnsApplied && lockStatus.firewallLocked;
+  const lockdownOk = functionalDnsProtection && lockStatus.firewallLocked;
   const hasWarnings = warnings.length > 0 || optionalWarnings.length > 0 || healthWarnings;
 
   lockStatus.status = getProtectionStatusForMode(lockdownOk, hasWarnings);
@@ -241,6 +252,18 @@ function isEnforcementCompliant() {
 }
 
 async function runLockdown(reason) {
+  if (activeLockdown) {
+    logger.info('NETWORK', `Lockdown already in progress — joining (${reason})`);
+    return activeLockdown;
+  }
+
+  activeLockdown = runLockdownInner(reason).finally(() => {
+    activeLockdown = null;
+  });
+  return activeLockdown;
+}
+
+async function runLockdownInner(reason) {
   const lockdownTimer = createPhaseTimer('lockdown-total', { reason });
   logPolicyModeStartup();
   logger.info('NETWORK', `Re-applying lockdown (${reason})`, { mode: getPolicyMode() });
@@ -252,142 +275,57 @@ async function runLockdown(reason) {
     return mock;
   }
 
-  const useFastPath = reason === 'startup' && isEnforcementCompliant();
-  if (useFastPath) {
-    logger.info('NETWORK', 'Fast path: DNS, DoH, firewall, and adapters already compliant — verify only');
-    const verifyTimer = createPhaseTimer('verification', { reason, fastPath: true });
-    const audit = dnsModule.getDnsAudit();
-    const dns = { ...dnsModule.verifyDNS(), applied: [], failed: [], fastPath: true };
-    const firewall = verifyFirewall();
-    verifyTimer.end({ firewallLocked: firewall.firewallLocked, dnsApplied: dns.dnsApplied });
+  invalidateDnsStatusCache();
 
-    const lockStatus = buildLockdownStatus(dns, firewall, audit, {
-      mongoDiagnostic: getLastMongoDiagnostic(),
-      browserDoh: getChromiumDoHPolicyStatus(),
-      fastPath: true,
-    });
-
-    getDnsHealthMonitor()
-      .runImmediateDnsHealthCheck(reason)
-      .catch((e) => logger.warn('NETWORK', 'Post-lockdown health check failed', e.message));
-
-    lockdownTimer.end({ fastPath: true, status: lockStatus.status });
-    return { ...lockStatus, dns, firewall, hosts: { ok: true, skipped: true }, audit, fastPath: true };
-  }
-
-  const browserTimer = createPhaseTimer('browser-doh-policy', { reason });
-  timedPhase('browser-doh-apply', () => applyChromiumCleanBrowsingDoH(), { reason });
-  const browserDoh = getChromiumDoHPolicyStatus();
-  browserTimer.end();
-
-  const dnsTimer = createPhaseTimer('dns-apply', { reason });
-  const dns = timedPhase('dns-enforcement', () => dnsModule.applyDNS(), { reason });
-  dnsTimer.end({
-    applied: dns.applied?.length || 0,
-    dnsApplied: dns.dnsApplied,
-  });
-  logger.info('NETWORK', 'DNS adapters configured', {
-    applied: dns.applied,
-    ipv4Locked: dns.ipv4Locked,
-    ipv6Locked: dns.ipv6Locked,
-  });
-
-  const atlasHosts = await clearAtlasHostsBlock().catch((e) => {
-    logger.warn('NETWORK', 'Clear Atlas hosts block failed', e.message);
-    return { ok: false };
-  });
-
-  const hostsSync = await syncAtlasHostsFromDoh().catch((e) => {
-    logger.warn('NETWORK', 'Atlas hosts sync failed', e.message);
-    return { ok: false, error: e.message };
-  });
-
-  const firewallTimer = createPhaseTimer('firewall-apply', { reason });
-  const firewall = timedPhase('firewall-enforcement', () => applyDnsFirewall(), { reason });
-  firewallTimer.end({ firewallLocked: firewall.firewallLocked });
-
-  const hosts = syncHostsIfEnabled();
-  flushDnsCache();
-  const auditTimer = createPhaseTimer('adapter-scan', { reason });
-  const audit = dnsModule.getDnsAudit();
-  auditTimer.end({ adapterCount: audit.interfaces?.length || 0 });
-
-  let enforcementVerification = null;
-  if (firewall.rawDnsBypassBlocked) {
-    try {
-      const verifyTimer = createPhaseTimer('verification', { reason });
-      enforcementVerification = runFullEnforcementVerification();
-      verifyTimer.end({ passed: enforcementVerification.passed });
-      logger.info('NETWORK', 'Full enforcement verification', {
-        passed: enforcementVerification.passed,
-        resolver: enforcementVerification.resolver?.passed,
-        bypass: enforcementVerification.bypass?.passed,
-        safeSite: enforcementVerification.safeSite?.passed,
-      });
-    } catch (e) {
-      logger.warn('NETWORK', 'Enforcement verification failed', e.message);
-    }
-  }
-
-  const mongoHostnames = discoverMongoHostsFromEnvFiles();
-  let mongoDiagnostic = null;
+  let core;
   try {
-    mongoDiagnostic = await runMongoDnsDiagnostic(mongoHostnames);
+    core = await runLockdownInWorker(reason);
   } catch (e) {
-    logger.warn('NETWORK', 'MongoDB DNS diagnostic failed', e.message);
-    mongoDiagnostic = {
-      mongoSrvResolvable: false,
-      mongoTxtResolvable: false,
-      mongoLookupOk: false,
-      error: e.message,
-    };
+    lockdownTimer.end({ ok: false, error: e.message });
+    throw e;
   }
 
-  let dockerWsl = null;
-  let devValidation = null;
-  if (isDeveloperLikeMode()) {
-    dockerWsl = await runDockerWslDiagnostics({ runProbes: reason === 'startup' }).catch((e) => {
-      logger.warn('DEV_MODE', 'Docker/WSL diagnostics failed', e.message);
-      return null;
-    });
-    devValidation = await validateDeveloperMode().catch((e) => {
-      logger.warn('DEV_MODE', 'Developer validation failed', e.message);
-      return { ok: false, errors: [e.message] };
-    });
+  if (core.mock) {
+    const mock = core.result;
+    lockdownTimer.end({ mock: true, status: mock.status });
+    return mock;
   }
+
+  const {
+    dns,
+    firewall,
+    audit,
+    browserDoh,
+    mongoDiagnostic,
+    dockerWsl,
+    devValidation,
+    atlasHosts,
+    hosts,
+    hostsSync,
+    tunnel,
+    fastPath,
+  } = core;
 
   const lockStatus = buildLockdownStatus(dns, firewall, audit, {
     mongoDiagnostic,
     browserDoh,
     dockerWsl,
     devValidation,
-    enforcementVerification,
+    enforcementVerification: 'worker',
+    fastPath,
   });
 
   logger.info('NETWORK', 'Post-lockdown validation', {
     mode: lockStatus.mode,
     status: lockStatus.status,
     strictMode: lockStatus.strictMode,
-    developerExceptionsApplied: lockStatus.developerExceptionsApplied,
     ipv4Locked: lockStatus.ipv4Locked,
     ipv6Locked: lockStatus.ipv6Locked,
     dnsIntegrity: lockStatus.dnsIntegrity,
-    dohConfigured: lockStatus.dohConfigured,
-    nrptApplied: lockStatus.nrptApplied,
-    nrptError: lockStatus.nrptError,
-    rogueServers: lockStatus.rogueServers,
-    firewallCoreLocked: lockStatus.firewallCoreLocked,
-    bypassResolversBlocked: lockStatus.bypassResolversBlocked,
-    rawDnsBypassBlocked: lockStatus.rawDnsBypassBlocked,
     firewallLocked: lockStatus.firewallLocked,
-    failedOptionalRules: lockStatus.failedOptionalRules?.length || 0,
-    globalBlockRemoved: !firewall.hasGlobalBlock,
-    hostsFallbackEnabled: lockStatus.hostsFallbackEnabled,
-    atlasHostsCleared: atlasHosts?.skipped !== false,
-    mongoDiagnostic,
-    warnings: lockStatus.warnings,
-    verification: dns.verification || null,
-    enforcementVerification,
+    rogueServers: lockStatus.rogueServers,
+    fastPath: !!fastPath,
+    tunnel,
   });
 
   if (!lockStatus.dnsApplied || !lockStatus.firewallLocked) {
@@ -403,7 +341,8 @@ async function runLockdown(reason) {
     .catch((e) => logger.warn('NETWORK', 'Post-lockdown health check failed', e.message));
 
   markRealEnforcementApplied();
-  lockdownTimer.end({ fastPath: false, status: lockStatus.status });
+  invalidateDnsStatusCache();
+  lockdownTimer.end({ fastPath: !!fastPath, status: lockStatus.status, worker: true });
 
   return {
     ...lockStatus,
@@ -413,6 +352,8 @@ async function runLockdown(reason) {
     audit,
     hostsSync,
     atlasHosts,
+    tunnel,
+    fastPath,
   };
 }
 
@@ -428,6 +369,7 @@ function startNetworkWatch(intervalMs = 30000) {
   const timer = setInterval(() => {
     const { isEnforcementDisabled } = require('./vpnViolationHandler');
     if (isEnforcementDisabled() || !isRealEnforcementAllowed('network-watch-tick')) return;
+    if (activeLockdown) return;
 
     try {
       refreshRuntimeExemptions();
@@ -436,19 +378,30 @@ function startNetworkWatch(intervalMs = 30000) {
     } catch (e) {
       logger.warn('NETWORK', 'Runtime exemption refresh failed', e.message);
     }
+
     const current = getNetworkFingerprint();
-    const dns = dnsModule.verifyDNS();
+    const dns = getVerifyDnsCached();
     const networkChanged = current.key && current.key !== last.key;
 
-    const dnsNotLocked = !dns.ipv4Locked || (!dns.strictMode && !dns.ipv6Locked);
+    const filteringInactive = !dns.functionalDnsProtection;
     const rogueDnsDetected = (dns.rogueServers || []).length > 0;
-    const dohConfigured = dns.dohConfigured;
     const firewallCompromised = !dns.firewallLocked;
 
-    const configIntegrityViolation =
-      dnsNotLocked || rogueDnsDetected || !dohConfigured || firewallCompromised;
+    const configIntegrityViolation = filteringInactive || firewallCompromised;
 
     if (!networkChanged && !configIntegrityViolation) return;
+
+    const now = Date.now();
+    if (activeLockdown) {
+      logger.info('NETWORK', 'Skipping watch re-lockdown — lockdown already running');
+      return;
+    }
+    if (now - lastWatchLockdownAt < WATCH_LOCKDOWN_COOLDOWN_MS) {
+      logger.info('NETWORK', 'Skipping watch re-lockdown — cooldown active', {
+        msSinceLast: now - lastWatchLockdownAt,
+      });
+      return;
+    }
 
     const reason = networkChanged ? 'network-changed' : 'dns-hijacked';
 
@@ -457,11 +410,10 @@ function startNetworkWatch(intervalMs = 30000) {
       from: last,
       to: current,
       rogue: dns.rogueServers,
-      ipv4Locked: dns.ipv4Locked,
-      ipv6Locked: dns.ipv6Locked,
-      dohConfigured,
+      functionalDnsProtection: dns.functionalDnsProtection,
       firewallCompromised,
     });
+    lastWatchLockdownAt = now;
     runLockdown(reason).catch((e) => logger.error('NETWORK', 'Lockdown failed', e.message));
     last = getNetworkFingerprint();
   }, intervalMs);

@@ -4,8 +4,6 @@ const path = require('path');
 
 const logger = require('./logger');
 
-const { disableIPv6Tunneling } = require('./dns');
-
 const { removeDnsFirewall } = require('./firewall');
 
 const { removeMongoNrptRules } = require('./mongoDns');
@@ -15,8 +13,6 @@ const { runLockdown, startNetworkWatch } = require('./networkWatch');
 const { logPolicyModeStartup, getPolicyMode } = require('./policyMode');
 
 const { getDnsHealthMonitor } = require('./services/dns');
-
-const { capturePreLockdownSnapshot } = require('./preLockdownSnapshot');
 
 const {
 
@@ -28,7 +24,7 @@ const {
 
 } = require('./vpnViolationHandler');
 
-const { setEnforcementInProgress } = require('./enforcementState');
+const { setEnforcementInProgress, getEnforcementStatus } = require('./enforcementState');
 
 const { createPhaseTimer } = require('./startupTiming');
 
@@ -37,8 +33,6 @@ const {
   shouldRunStartupLockdown,
 
   logStartupEnforcementPolicy,
-
-  markRealEnforcementApplied,
 
   shouldRunQuitCleanup,
 
@@ -147,99 +141,48 @@ async function runBackgroundLockdown() {
 
 
   if (isEnforcementDisabled()) {
-
     logger.warn('STARTUP', 'Skipping lockdown — challenge failed or VPN enforcement disabled');
-
     await runMockStartupLockdown('enforcement-disabled');
-
     return;
-
   }
 
-
-
-  setEnforcementInProgress(true);
+  if (!getEnforcementStatus().inProgress) {
+    setEnforcementInProgress(true);
+  }
 
   try {
-
-    const snapshotTimer = createPhaseTimer('pre-lockdown-snapshot');
-
-    capturePreLockdownSnapshot();
-
-    snapshotTimer.end();
-
-
-
     const startupDeadline = checkDeadlineOnStartup();
 
     if (startupDeadline.action === 'deadline_expired') {
-
       logger.error('STARTUP', 'VPN re-apply deadline expired while app was closed', startupDeadline);
-
     }
-
-
 
     const lockdown = await runLockdown('startup');
 
-    markRealEnforcementApplied();
-
-
-
-    const tunnelTimer = createPhaseTimer('ipv6-tunnel-disable');
-
-    const tunnelResult = disableIPv6Tunneling();
-
-    tunnelTimer.end();
-
-
-
     logger.info('STARTUP', 'Lockdown summary', {
-
       mode: lockdown.mode,
-
       status: lockdown.status,
-
       protectionLabel: lockdown.protectionLabel,
-
       fastPath: lockdown.fastPath,
-
       mock: lockdown.mock,
-
       developerExceptionsApplied: lockdown.developerExceptionsApplied,
-
       dnsApplied: lockdown.dnsApplied,
-
       ipv4Locked: lockdown.ipv4Locked,
-
       ipv6Locked: lockdown.ipv6Locked,
-
       dnsIntegrity: lockdown.dnsIntegrity,
-
       dohConfigured: lockdown.dohConfigured,
-
       nrptApplied: lockdown.nrptApplied,
-
       nrptError: lockdown.nrptError,
-
       firewallLocked: lockdown.firewallLocked,
-
       firewallCoreLocked: lockdown.firewallCoreLocked,
-
       bypassResolversBlocked: lockdown.bypassResolversBlocked,
-
       hostsFallbackEnabled: lockdown.hostsFallbackEnabled,
-
       mongoDiagnostic: lockdown.mongoDiagnostic,
-
       rogueServers: lockdown.rogueServers,
-
       warnings: lockdown.warnings,
-
       error: lockdown.error,
-
-      tunnel: tunnelResult,
-
+      tunnel: lockdown.tunnel,
+      worker: true,
     });
 
 
@@ -291,27 +234,21 @@ async function runBackgroundLockdown() {
 
 
 app.whenReady().then(async () => {
-
   logPolicyModeStartup();
-
   logger.info('STARTUP', 'NetFast Electron ready', { mode: getPolicyMode() });
 
-
-
   const windowTimer = createPhaseTimer('window-creation');
-
   createWindow();
-
   windowTimer.end();
 
+  const challenge = await getSavedChallengeState();
+  if (shouldRunStartupLockdown(challenge) && !isEnforcementDisabled()) {
+    setEnforcementInProgress(true);
+  }
 
-
-  setImmediate(() => {
-
+  setTimeout(() => {
     runBackgroundLockdown();
-
-  });
-
+  }, 250);
 });
 
 

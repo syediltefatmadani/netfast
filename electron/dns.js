@@ -10,6 +10,7 @@ const {
   getActiveAdapters,
   applyNetworkEnforcement,
 } = require('./networkEnforcement');
+const { runFunctionalDnsVerification, invalidateFunctionalDnsCache } = require('./functionalDnsVerification');
 
 function run(cmd, tag) {
   logger.info(tag, `> ${cmd}`);
@@ -215,6 +216,7 @@ Get-DnsClientDohServerAddress -ErrorAction SilentlyContinue | ForEach-Object {
 foreach ($s in $servers) {
   Add-DnsClientDohServerAddress -ServerAddress $s -DohTemplate $tpl -AllowFallbackToUdp $false -ErrorAction SilentlyContinue
 }
+Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Dnscache\\Parameters' -Name 'EnableAutoDoh' -Value 2 -Type DWord -Force -ErrorAction SilentlyContinue
 'ok'
 `;
   try {
@@ -281,14 +283,21 @@ function applyDNS() {
   const audit = getDnsAudit();
   const dohConfigured = doh?.ok !== false && checkDoHConfig();
   const strictMode = Boolean(enforcement.strictMode);
-  const dnsApplied = audit.ipv4Locked && (strictMode || audit.ipv6Locked);
+  const ipv4ConfigLocked = audit.ipv4Locked;
+  const ipv6ConfigLocked = strictMode ? audit.ipv4Locked : audit.ipv6Locked;
+  const functional = runFunctionalDnsVerification({ timeoutSec: 8 });
+  const dnsApplied = functional.functionalDnsProtection;
 
   const status = {
     dnsApplied,
-    ipv4Locked: audit.ipv4Locked,
-    ipv6Locked: strictMode ? true : audit.ipv6Locked,
+    ipv4Locked: ipv4ConfigLocked,
+    ipv6Locked: ipv6ConfigLocked,
+    ipv4ConfigLocked,
+    ipv6ConfigLocked,
+    functionalDnsProtection: functional.functionalDnsProtection,
+    blockedDomainTests: functional.blockedDomainTests,
     strictMode,
-    dnsIntegrity: false,
+    dnsIntegrity: functional.functionalDnsProtection,
     dohConfigured,
     nrptApplied: Boolean(nrpt.nrptApplied),
     nrptError: nrpt.nrptError || null,
@@ -300,16 +309,33 @@ function applyDNS() {
     audit,
     enforcement,
     verification: enforcement.verification,
+    functionalVerification: functional,
   };
-  status.dnsIntegrity =
-    status.dnsApplied && status.dohConfigured && (status.rogueServers || []).length === 0;
+  if (status.dohConfigured && (status.rogueServers || []).length === 0) {
+    status.dnsIntegrity = functional.functionalDnsProtection;
+  }
 
   if (strictMode) {
     logger.info('DNS', 'Strict fallback active — IPv6 bindings disabled, IPv4 CleanBrowsing enforced');
   }
 
-  if (!status.dnsApplied) {
-    logger.error('DNS', 'DNS lock incomplete after apply', status);
+  if (!functional.functionalDnsProtection) {
+    logger.error('DNS', 'Functional DNS filtering verification failed after apply', {
+      blockedDomainTests: functional.blockedDomainTests,
+      ipv4ConfigLocked,
+      ipv6ConfigLocked,
+    });
+  } else if (!ipv4ConfigLocked || !ipv6ConfigLocked) {
+    logger.warn('DNS', 'Filtering active via functional test; adapter DNS config is indirect', {
+      ipv4ConfigLocked,
+      ipv6ConfigLocked,
+      blockedDomainTests: functional.blockedDomainTests,
+    });
+    logger.info('DNS', 'DNS filtering applied successfully (functional)', {
+      adapters: status.applied,
+      strictMode,
+      functionalDnsProtection: true,
+    });
   } else {
     logger.info('DNS', 'DNS lock applied successfully', {
       adapters: status.applied,
@@ -397,11 +423,13 @@ function verifyDNS() {
     } catch {
       /* optional */
     }
-    const ipv4Locked = audit.ipv4Locked;
-    const ipv6Locked = strictMode ? ipv4Locked : audit.ipv6Locked;
-    const dnsApplied = ipv4Locked && ipv6Locked;
+    const ipv4ConfigLocked = audit.ipv4Locked;
+    const ipv6ConfigLocked = strictMode ? ipv4ConfigLocked : audit.ipv6Locked;
+    const functional = runFunctionalDnsVerification({ timeoutSec: 8 });
+    const functionalDnsProtection = functional.functionalDnsProtection;
+    const dnsApplied = functionalDnsProtection;
     const rogueServers = audit.rogueServers;
-    const dnsIntegrity = dnsApplied && dohConfigured && firewallLocked && rogueServers.length === 0;
+    const dnsIntegrity = functionalDnsProtection && firewallLocked;
 
     const { getDnsHealthMonitor, isProtectionActive } = require('./services/dns');
     const health = getDnsHealthMonitor().getLastReport();
@@ -422,20 +450,14 @@ function verifyDNS() {
         };
       }) || [];
 
-    const filteringActive = health ? isProtectionActive(health.status) : false;
-    const blockedDomains =
-      health?.validation?.policy?.results
-        ?.filter((r) => r.evaluation?.finalBlocked ?? r.ok)
-        .map((r) => r.domain) || [];
-    const unblockedDomains =
-      health?.validation?.policy?.results
-        ?.filter((r) => !(r.evaluation?.finalBlocked ?? r.ok))
-        .map((r) => r.domain) || [];
-
     const result = {
       dnsApplied,
-      ipv4Locked,
-      ipv6Locked,
+      ipv4Locked: ipv4ConfigLocked,
+      ipv6Locked: ipv6ConfigLocked,
+      ipv4ConfigLocked,
+      ipv6ConfigLocked,
+      functionalDnsProtection,
+      blockedDomainTests: functional.blockedDomainTests,
       strictMode,
       firewallLocked,
       firewallCoreLocked: fw.firewallCoreLocked,
@@ -445,14 +467,15 @@ function verifyDNS() {
       dohConfigured,
       firewallIntact: firewallLocked,
       rogueDns: rogueServers,
-      filteringActive,
-      blockedDomains,
-      unblockedDomains,
-      ipv4: { intact: ipv4Locked, servers: audit.interfaces, rogue: rogueServers },
-      ipv6: { intact: ipv6Locked, servers: audit.interfaces, rogue: rogueServers },
+      filteringActive: functionalDnsProtection || (health ? isProtectionActive(health.status) : false),
+      blockedDomains: functional.blockedDomainTests.filter((t) => t.blocked).map((t) => t.domain),
+      unblockedDomains: functional.blockedDomainTests.filter((t) => !t.blocked).map((t) => t.domain),
+      ipv4: { intact: ipv4ConfigLocked, servers: audit.interfaces, rogue: rogueServers },
+      ipv6: { intact: ipv6ConfigLocked, servers: audit.interfaces, rogue: rogueServers },
       expected: DNS,
       probes,
       audit,
+      functionalVerification: functional,
       dnsHealth: health
         ? {
             status: health.status,
@@ -464,15 +487,21 @@ function verifyDNS() {
     };
 
     if (rogueServers.length) {
-      logger.warn('DNS', 'Rogue DNS servers detected', rogueServers);
+      logger.warn('DNS', 'Rogue DNS servers detected (informational)', rogueServers);
     }
-    if (!ipv6Locked) {
-      logger.warn('DNS', 'IPv6 DNS is not locked to CleanBrowsing');
+    if (!ipv6ConfigLocked) {
+      logger.warn('DNS', 'IPv6 adapter DNS is not set to CleanBrowsing (informational)');
+    }
+    if (!functionalDnsProtection) {
+      logger.error('DNS', 'Functional DNS filtering failed — blocked domains are resolving', {
+        blockedDomainTests: functional.blockedDomainTests,
+      });
     }
     logger.info('DNS', 'Verify DNS', {
       dnsApplied,
-      ipv4Locked,
-      ipv6Locked,
+      functionalDnsProtection,
+      ipv4ConfigLocked,
+      ipv6ConfigLocked,
       strictMode,
       firewallLocked,
       dnsIntegrity,
@@ -486,6 +515,8 @@ function verifyDNS() {
       dnsApplied: false,
       ipv4Locked: false,
       ipv6Locked: false,
+      functionalDnsProtection: false,
+      blockedDomainTests: [],
       firewallLocked: false,
       rogueServers: [],
       dnsIntegrity: false,
@@ -541,6 +572,7 @@ module.exports = {
   verifyTeredoDisabled,
   configureWindowsDoH,
   checkDoHConfig,
+  invalidateFunctionalDnsCache,
   DNS,
   ALLOWED_IPV4_DNS,
   ALLOWED_IPV6_DNS,

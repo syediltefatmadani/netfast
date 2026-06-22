@@ -13,8 +13,7 @@ const STATUS_MESSAGES = {
 };
 
 function useHostsBlockEnabled() {
-  const v = (process.env.NETFAST_HOSTS_BLOCK ?? '1').toLowerCase();
-  return v !== '0' && v !== 'false' && v !== 'no';
+  return getHostsHelpers().isHostsFileEnforcementEnabled() && getHostsHelpers().useHostsBlocklist();
 }
 
 function getHostsHelpers() {

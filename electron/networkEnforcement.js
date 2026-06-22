@@ -361,36 +361,37 @@ function applyDnsToTargets(adapterNames, { strictMode = false, adapterRows = nul
     return { applied: adapterNames, failed: [], skipped: true };
   }
 
-  try {
-    const out = runEncoded(buildBatchedDnsApplyScript(toApply, { strictMode }));
-    const parsed = JSON.parse(out.trim() || '[]');
-    const results = Array.isArray(parsed) ? parsed : [parsed];
-    const applied = [];
-    const failed = [];
+  const CHUNK_SIZE = 2;
+  const applied = [];
+  const failed = [];
 
-    for (const result of results) {
-      if (result.ipv4Ok && result.ipv6Ok) applied.push(result.adapter);
-      else {
-        const fallback = applyDnsViaNetsh(result.adapter, { strictMode });
-        if (fallback.ipv4Ok && fallback.ipv6Ok) applied.push(result.adapter);
-        else failed.push({ ...result, ...fallback });
+  for (let i = 0; i < toApply.length; i += CHUNK_SIZE) {
+    const chunk = toApply.slice(i, i + CHUNK_SIZE);
+    try {
+      const out = runEncoded(buildBatchedDnsApplyScript(chunk, { strictMode }));
+      const parsed = JSON.parse(out.trim() || '[]');
+      const results = Array.isArray(parsed) ? parsed : [parsed];
+
+      for (const result of results) {
+        if (result.ipv4Ok && result.ipv6Ok) applied.push(result.adapter);
+        else {
+          const fallback = applyDnsViaNetsh(result.adapter, { strictMode });
+          if (fallback.ipv4Ok && fallback.ipv6Ok) applied.push(result.adapter);
+          else failed.push({ ...result, ...fallback });
+        }
+      }
+    } catch (e) {
+      logger.execError('ENFORCE', 'Batched DNS apply failed — falling back per adapter', e);
+      for (const name of chunk) {
+        const result = applyDnsToAdapter(name, { strictMode });
+        if (result.ipv4Ok && result.ipv6Ok) applied.push(name);
+        else failed.push(result);
       }
     }
-
-    const alreadyOk = adapterNames.filter((n) => !toApply.includes(n));
-    return { applied: [...new Set([...alreadyOk, ...applied])], failed };
-  } catch (e) {
-    logger.execError('ENFORCE', 'Batched DNS apply failed — falling back per adapter', e);
-    const applied = [];
-    const failed = [];
-    for (const name of toApply) {
-      const result = applyDnsToAdapter(name, { strictMode });
-      if (result.ipv4Ok && result.ipv6Ok) applied.push(name);
-      else failed.push(result);
-    }
-    const alreadyOk = adapterNames.filter((n) => !toApply.includes(n));
-    return { applied: [...new Set([...alreadyOk, ...applied])], failed };
   }
+
+  const alreadyOk = adapterNames.filter((n) => !toApply.includes(n));
+  return { applied: [...new Set([...alreadyOk, ...applied])], failed };
 }
 
 function applyDnsToAdapter(adapterName, { strictMode = false } = {}) {
@@ -447,22 +448,37 @@ function clearDnsCacheFull() {
   return flush;
 }
 
-function resolveDnsName(domain) {
+function resolveDnsName(domain, { timeoutSec = 15 } = {}) {
   const safeDomain = domain.replace(/'/g, "''");
   const script = `
 $domain = '${safeDomain}'
+$timeoutSec = ${Math.max(2, Math.min(timeoutSec, 30))}
 $records = @()
+$result = $null
 try {
-  $results = Resolve-DnsName -Name $domain -ErrorAction Stop
-  foreach ($r in $results) {
-    if ($r.Type -eq 'A' -or $r.Type -eq 'AAAA') {
-      $records += [PSCustomObject]@{ type = $r.Type; address = $r.IPAddress.ToString() }
+  $job = Start-Job -ScriptBlock {
+    param($d)
+    Resolve-DnsName -Name $d -ErrorAction Stop
+  } -ArgumentList $domain
+  $done = Wait-Job $job -Timeout $timeoutSec
+  if (-not $done) {
+    Stop-Job $job -Force -ErrorAction SilentlyContinue
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    $result = [PSCustomObject]@{ ok = $false; timedOut = $true; error = 'timeout'; records = @() }
+  } else {
+    $results = Receive-Job $job -ErrorAction SilentlyContinue
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    foreach ($r in @($results)) {
+      if ($r.Type -eq 'A' -or $r.Type -eq 'AAAA') {
+        $records += [PSCustomObject]@{ type = $r.Type; address = $r.IPAddress.ToString() }
+      }
     }
+    $result = [PSCustomObject]@{ ok = $true; timedOut = $false; error = $null; records = $records }
   }
-  [PSCustomObject]@{ ok = $true; error = $null; records = $records }
 } catch {
-  [PSCustomObject]@{ ok = $false; error = $_.Exception.Message; records = @() }
-} | ConvertTo-Json -Compress -Depth 4
+  $result = [PSCustomObject]@{ ok = $false; timedOut = $false; error = $_.Exception.Message; records = @() }
+}
+$result | ConvertTo-Json -Compress -Depth 4
 `;
   try {
     const out = runEncoded(script);
@@ -713,13 +729,13 @@ function logPreEnforcementFirewallState() {
   }
 }
 
-function runResolverVerification() {
+function runResolverVerification({ resolveTimeoutSec = 6 } = {}) {
   const results = [];
   let ipv4Ok = true;
   let ipv6Ok = true;
 
   for (const domain of VERIFICATION_DOMAINS) {
-    const resolveResult = resolveDnsName(domain);
+    const resolveResult = resolveDnsName(domain, { timeoutSec: resolveTimeoutSec });
     const curlResult = curlHead(domain);
     const evaluation = evaluateDomainVerification(domain, resolveResult, curlResult);
     results.push(evaluation);
@@ -968,7 +984,7 @@ function applyNetworkEnforcement() {
     failed = failed.filter((f) => !afterSweep.applied.includes(f.adapter)).concat(afterSweep.failed);
   }
 
-  let verification = runResolverVerification();
+  let verification = runResolverVerification({ resolveTimeoutSec: 6 });
   let ipv6NeedsFallback = !verification.ipv6Ok && !strictMode;
 
   if (ipv6NeedsFallback) {
@@ -984,7 +1000,7 @@ function applyNetworkEnforcement() {
       applyDnsToAdapter(name, { strictMode: true });
     }
     clearDnsCacheFull();
-    verification = runResolverVerification();
+    verification = runResolverVerification({ resolveTimeoutSec: 6 });
     verification.strictFallbackApplied = true;
     verification.ipv6DisableResults = disableResults;
   }

@@ -69,12 +69,15 @@ const BLOCKED_DOMAINS = [
 
 
 
+/** Master switch — when false, NetFast never reads, writes, or monitors the Windows hosts file. */
+function isHostsFileEnforcementEnabled() {
+  return false;
+}
+
 function useHostsBlocklist() {
-
+  if (!isHostsFileEnforcementEnabled()) return false;
   const v = (process.env.NETFAST_HOSTS_BLOCK ?? '1').toLowerCase();
-
   return v !== '0' && v !== 'false' && v !== 'no';
-
 }
 
 
@@ -214,6 +217,17 @@ function buildBlockSection() {
  */
 
 async function ensureHostsBlockedDomains(domains, reason = 'manual') {
+  if (!isHostsFileEnforcementEnabled()) {
+    return {
+      ok: true,
+      added: [],
+      alreadyPresent: [],
+      failed: [],
+      path: getHostsPath(),
+      reason: 'hosts_file_enforcement_disabled',
+      skipped: true,
+    };
+  }
 
   const hostsPath = getHostsPath();
 
@@ -336,12 +350,14 @@ async function ensureHostsBlockedDomains(domains, reason = 'manual') {
 
 
 function syncHostsBlocklist() {
+  const hostsPath = getHostsPath();
+  if (!isHostsFileEnforcementEnabled()) {
+    return { ok: true, path: hostsPath, skipped: true, reason: 'hosts_file_enforcement_disabled' };
+  }
   if (!assertRealEnforcementAllowed('hosts-blocklist-write')) {
     logger.info('DEV_SAFE', 'Mock hosts blocklist sync success');
     return { ok: true, skipped: true, mock: true, reason: 'dev_safe_mode' };
   }
-
-  const hostsPath = getHostsPath();
 
   logger.info('HOSTS', 'Resolving hosts file', {
 
@@ -452,12 +468,14 @@ function syncHostsBlocklist() {
 /** Atlas hostnames resolved via DoH (port 53 UDP is locked; hosts gives system resolver fixed A records). */
 
 function syncMongoHostsEntries(entries) {
+  const hostsPath = getHostsPath();
+  if (!isHostsFileEnforcementEnabled()) {
+    return { ok: true, path: hostsPath, skipped: true, reason: 'hosts_file_enforcement_disabled' };
+  }
   if (!assertRealEnforcementAllowed('hosts-mongo-write')) {
     logger.info('DEV_SAFE', 'Mock Mongo hosts sync success');
     return { ok: true, skipped: true, mock: true };
   }
-
-  const hostsPath = getHostsPath();
 
 
 
@@ -610,6 +628,8 @@ function syncMongoHostsEntries(entries) {
 
 
 module.exports = {
+
+  isHostsFileEnforcementEnabled,
 
   getHostsPath,
 

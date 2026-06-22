@@ -4,7 +4,7 @@ const path = require('path');
 const crypto = require('crypto');
 const logger = require('./logger');
 const dnsModule = require('./dns');
-const { getHostsPath } = require('./hosts');
+const { isHostsFileEnforcementEnabled, getHostsPath } = require('./hosts');
 const { getDnsHealthMonitor, isProtectionActive } = require('./services/dns');
 
 let hostsHash = null;
@@ -159,6 +159,9 @@ function checkRogueDNS() {
 }
 
 function checkHostsFile() {
+  if (!isHostsFileEnforcementEnabled()) {
+    return { violated: false, skipped: true, reason: 'hosts_monitoring_disabled' };
+  }
   const hostsPath = getHostsPath();
   try {
     if (!fs.existsSync(hostsPath)) {
@@ -234,11 +237,12 @@ function runFullCheck() {
 
   const vectors = {
     dns_filtering: {
-      violated: dnsFilteringViolated,
+      violated: !dns.functionalDnsProtection,
       status: healthReport?.status,
       details: healthReport?.details,
       finalStatus: healthReport?.finalStatus,
       criticalUnblocked: summary?.criticalUnblockedRestrictedDomains || [],
+      blockedDomainTests: dns.blockedDomainTests || [],
     },
     dns_provider_miss: {
       violated: false,
@@ -250,19 +254,18 @@ function runFullCheck() {
     },
     fallback_blocking: {
       violated: false,
-      active:
-        fallbackBlockedMisses.length > 0 ||
-        (require('./hosts').useHostsBlocklist() &&
-          require('./hosts').getAllBlockedDomains().length > 0),
+      active: fallbackBlockedMisses.length > 0,
       layers: fallbackBlockedMisses.length ? ['hosts_supplement'] : [],
     },
     dns_ipv4: {
-      violated: !dns.ipv4Locked,
+      violated: !dns.functionalDnsProtection,
+      configLocked: dns.ipv4Locked,
       rogue: (dns.rogueServers || []).filter((r) => r.family === 'IPv4'),
       dohStatus: healthReport?.status,
     },
     dns_ipv6: {
-      violated: !dns.ipv6Locked,
+      violated: !dns.functionalDnsProtection,
+      configLocked: dns.ipv6Locked,
       rogue: (dns.rogueServers || []).filter((r) => r.family === 'IPv6'),
     },
     windows_doh: {

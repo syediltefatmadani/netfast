@@ -84,6 +84,8 @@ function initResolversAndRules() {
   for (const ip of ALLOWED_RESOLVERS) {
     const slug = ipToRuleSlug(ip);
     EXPECTED_CORE_RULES.push(`${RULE_PREFIX}Allow-TCP-443-${slug}`);
+    EXPECTED_CORE_RULES.push(`${RULE_PREFIX}Allow-UDP-53-${slug}`);
+    EXPECTED_CORE_RULES.push(`${RULE_PREFIX}Allow-TCP-53-${slug}`);
   }
 
   EXPECTED_BYPASS_RULES = [];
@@ -362,25 +364,31 @@ function applyDnsFirewall() {
   for (const ip of ALLOWED_RESOLVERS) {
     const slug = ipToRuleSlug(ip);
     const cidr = ip.includes(':') ? `${ip}/128` : `${ip}/32`;
-    const httpsRule = `${RULE_PREFIX}Allow-TCP-443-${slug}`;
-    const httpsResult = ensureFirewallRule({
-      name: httpsRule,
-      dir: 'out',
-      action: 'allow',
-      protocol: 'TCP',
-      remoteip: cidr,
-      remoteport: '443',
-      category: 'core',
-    });
-    if (httpsResult.ok) {
-      succeeded.push(httpsRule);
-      if (httpsResult.skipped) rulesSkipped++;
-      else if (httpsResult.created) rulesCreated++;
-      else if (httpsResult.enabled) rulesEnabled++;
-    } else {
-      failed.push({ rule: httpsRule, error: httpsResult.reason });
-      failedCoreRules.push(httpsResult);
-      if (httpsResult.adminRequired) adminRequired = true;
+    const coreRules = [
+      { name: `${RULE_PREFIX}Allow-TCP-443-${slug}`, protocol: 'TCP', remoteport: '443' },
+      { name: `${RULE_PREFIX}Allow-UDP-53-${slug}`, protocol: 'UDP', remoteport: '53' },
+      { name: `${RULE_PREFIX}Allow-TCP-53-${slug}`, protocol: 'TCP', remoteport: '53' },
+    ];
+    for (const spec of coreRules) {
+      const result = ensureFirewallRule({
+        name: spec.name,
+        dir: 'out',
+        action: 'allow',
+        protocol: spec.protocol,
+        remoteip: cidr,
+        remoteport: spec.remoteport,
+        category: 'core',
+      });
+      if (result.ok) {
+        succeeded.push(spec.name);
+        if (result.skipped) rulesSkipped++;
+        else if (result.created) rulesCreated++;
+        else if (result.enabled) rulesEnabled++;
+      } else {
+        failed.push({ rule: spec.name, error: result.reason });
+        failedCoreRules.push(result);
+        if (result.adminRequired) adminRequired = true;
+      }
     }
   }
 

@@ -2,10 +2,19 @@ const { getPolicyMode, getModeLabel } = require('./policyMode');
 const { getChromiumDoHPolicyStatus } = require('./browserPolicy');
 
 function getMockVerifyDnsResult() {
+  const blockedDomainTests = [
+    { domain: 'reddit.com', blocked: true, result: 'DNS name does not exist' },
+    { domain: 'pornhat.one', blocked: true, result: 'DNS name does not exist' },
+    { domain: 'xvideos.com', blocked: true, result: 'DNS name does not exist' },
+  ];
   return {
     dnsApplied: true,
     ipv4Locked: true,
     ipv6Locked: true,
+    ipv4ConfigLocked: true,
+    ipv6ConfigLocked: true,
+    functionalDnsProtection: true,
+    blockedDomainTests,
     strictMode: false,
     firewallLocked: true,
     firewallCoreLocked: true,

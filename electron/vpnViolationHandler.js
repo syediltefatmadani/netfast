@@ -78,7 +78,7 @@ function validateFullProtection() {
   const browserDoh = getChromiumDoHPolicyStatus();
 
   const failures = [];
-  if (!dns.ipv4Locked || !dns.ipv6Locked) failures.push('DNS not locked');
+  if (!dns.functionalDnsProtection) failures.push('DNS filtering not active');
   if (!dns.dohConfigured) failures.push('Windows DoH not configured');
   if (!dns.firewallLocked || !dns.firewallCoreLocked) failures.push('Firewall not locked');
   if (dns.bypassResolversBlocked === false) failures.push('Bypass resolvers not blocked');

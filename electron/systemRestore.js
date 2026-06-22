@@ -14,6 +14,10 @@ const {
 const { restoreEnforcementBackup } = require('./networkEnforcement');
 
 function removeFocuslockHostsSections() {
+  const { isHostsFileEnforcementEnabled } = require('./hosts');
+  if (!isHostsFileEnforcementEnabled()) {
+    return { ok: true, skipped: true, reason: 'hosts_file_enforcement_disabled' };
+  }
   const fs = require('fs');
   const { getHostsPath, MARKER_BEGIN, MARKER_END, MONGO_MARKER_BEGIN, MONGO_MARKER_END } = require('./hosts');
   const hostsPath = getHostsPath();

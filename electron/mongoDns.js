@@ -424,11 +424,26 @@ function getLastMongoDiagnostic() {
 async function clearAtlasHostsBlock() {
   mongoDnsFallbackUsed = false;
   hostsFallbackUsed = false;
+  const { isHostsFileEnforcementEnabled } = require('./hosts');
+  if (!isHostsFileEnforcementEnabled()) {
+    return { ok: true, skipped: true, reason: 'hosts_file_enforcement_disabled' };
+  }
   return syncMongoHostsEntries([]);
 }
 
 /** Emergency only when MONGO_HOSTS_FALLBACK=true */
 async function syncAtlasHostsFromDoh(extraHostnames = []) {
+  const { isHostsFileEnforcementEnabled } = require('./hosts');
+  if (!isHostsFileEnforcementEnabled()) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'hosts_file_enforcement_disabled',
+      hostsFallbackEnabled: false,
+      mongoDnsFallbackUsed: false,
+      hostsFallbackUsed: false,
+    };
+  }
   const hostsFallbackEnabled = isHostsFallbackEnabled();
   logger.info('MONGO_DNS', 'Atlas hosts handling', {
     hostsFallbackEnabled,

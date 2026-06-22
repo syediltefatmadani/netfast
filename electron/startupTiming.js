@@ -1,5 +1,10 @@
 const logger = require('./logger');
 
+/** Let the Electron main process handle window/IPC events between heavy sync work. */
+function yieldToEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 function createPhaseTimer(phase, context = {}) {
   const startMs = Date.now();
   return {
@@ -35,4 +40,4 @@ async function timedPhaseAsync(phase, fn, context = {}) {
   }
 }
 
-module.exports = { createPhaseTimer, timedPhase, timedPhaseAsync };
+module.exports = { createPhaseTimer, timedPhase, timedPhaseAsync, yieldToEventLoop };

@@ -9,6 +9,11 @@ function setEnforcementInProgress(value, status = null) {
   if (!value && status) {
     lastStatus = status;
     lastCompletedAt = Date.now();
+    try {
+      require('./dnsStatusCache').invalidateDnsStatusCache();
+    } catch {
+      /* optional during early startup */
+    }
   }
   notifyRenderer();
 }

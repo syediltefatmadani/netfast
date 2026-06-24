@@ -423,7 +423,10 @@ async function runWatchCheck(trigger = 'poll') {
 
   const filteringInactive = !dns.functionalDnsProtection;
   const firewallCompromised = !dns.firewallLocked;
-  const configIntegrityViolation = filteringInactive || firewallCompromised;
+  const dohCompromised = dns.dohConfigured === false;
+  const adapterDnsCompromised = !dns.ipv4Locked || !dns.ipv6Locked;
+  const configIntegrityViolation =
+    firewallCompromised || dohCompromised || adapterDnsCompromised;
 
   if (!networkChanged && !configIntegrityViolation) {
     watchLast = current;
@@ -454,7 +457,7 @@ async function runWatchCheck(trigger = 'poll') {
     firewallCompromised,
   });
   lastWatchLockdownAt = now;
-  await runLockdown(reason).catch((e) => logger.error('NETWORK', 'Lockdown failed', e.message));
+  await module.exports.runLockdown(reason).catch((e) => logger.error('NETWORK', 'Lockdown failed', e.message));
   watchLast = await getNetworkFingerprintAsync();
 }
 

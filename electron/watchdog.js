@@ -274,15 +274,17 @@ function buildFullCheckResult({ dns, battery, hostsState, firefoxDoh, chromeDoh,
     summary?.fallbackBlockedMisses || healthReport?.fallbackBlockedMisses || [];
   const filteringActive = dns.filteringActive;
 
+  const skippedAdultProbes = summary?.skipAdultDomainProbes === true;
   const dnsFilteringViolated =
     criticalUnblocked ||
-    (!knownAdultBlockedByDoh &&
+    (!skippedAdultProbes &&
+      !knownAdultBlockedByDoh &&
       !(healthReport?.healthy) &&
       fallbackBlockedMisses.length < providerMisses.length);
 
   const vectors = {
     dns_filtering: {
-      violated: !dns.functionalDnsProtection,
+      violated: dnsFilteringViolated,
       status: healthReport?.status,
       details: healthReport?.details,
       finalStatus: healthReport?.finalStatus,
@@ -303,13 +305,17 @@ function buildFullCheckResult({ dns, battery, hostsState, firefoxDoh, chromeDoh,
       layers: fallbackBlockedMisses.length ? ['hosts_supplement'] : [],
     },
     dns_ipv4: {
-      violated: !dns.functionalDnsProtection,
+      violated:
+        !dns.ipv4Locked ||
+        (dns.rogueServers || []).some((r) => r.family === 'IPv4'),
       configLocked: dns.ipv4Locked,
       rogue: (dns.rogueServers || []).filter((r) => r.family === 'IPv4'),
       dohStatus: healthReport?.status,
     },
     dns_ipv6: {
-      violated: !dns.functionalDnsProtection,
+      violated:
+        !dns.ipv6Locked ||
+        (dns.rogueServers || []).some((r) => r.family === 'IPv6'),
       configLocked: dns.ipv6Locked,
       rogue: (dns.rogueServers || []).filter((r) => r.family === 'IPv6'),
     },

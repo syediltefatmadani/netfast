@@ -14,7 +14,10 @@ const assert = require('node:assert');
 
 // Mock dependencies BEFORE requiring the modules under test to prevent OS side-effects
 const powershell = require('../../../powershell');
-powershell.runEncoded = () => '{"gw":"192.168.1.1","ip":"192.168.1.10","dns":"1.1.1.1"}';
+const STABLE_FINGERPRINT_JSON =
+  '{"gw":"192.168.1.1","ip":"192.168.1.10","dns":"1.1.1.1","adapters":""}';
+powershell.runEncoded = () => STABLE_FINGERPRINT_JSON;
+powershell.runEncodedAsync = async () => STABLE_FINGERPRINT_JSON;
 
 const browserPolicy = require('../../../browserPolicy');
 browserPolicy.applyChromiumCleanBrowsingDoH = () => ({ ok: true });
@@ -92,7 +95,9 @@ function makeDnsResult({
   firewallLocked = true,
   rogueServers = [],
   filteringActive = true,
+  functionalDnsProtection,
 } = {}) {
+  const functional = functionalDnsProtection ?? filteringActive;
   const dnsApplied = ipv4Locked && ipv6Locked;
   const dnsIntegrity =
     dnsApplied && dohConfigured && firewallLocked && rogueServers.length === 0;
@@ -107,6 +112,12 @@ function makeDnsResult({
     rogueServers,
     rogueDns: rogueServers,
     filteringActive,
+    functionalDnsProtection: functional,
+    functionalVerification: {
+      functionalDnsProtection: functional,
+      blockedDomainTests: [],
+      skippedAdultProbes: true,
+    },
     blockedDomains: filteringActive ? ['pornhat.com'] : [],
     unblockedDomains: filteringActive ? [] : ['pornhat.com'],
     audit: { intact: dnsIntegrity, ipv4Locked, ipv6Locked, rogueServers, rogue: rogueServers },
@@ -119,18 +130,22 @@ function makeDnsResult({
 // --------------------------------------------------------------------------
 describe('Watchdog vector logic — integrity vs filtering', () => {
   let savedVerifyDNS;
+  let savedVerifyDNSAsync;
   let savedVerifyTeredoDisabled;
 
   before(() => {
     // Save originals
     savedVerifyDNS          = dnsExports.verifyDNS;
+    savedVerifyDNSAsync     = dnsExports.verifyDNSAsync;
     savedVerifyTeredoDisabled = dnsExports.verifyTeredoDisabled;
     // Stub Teredo so it never does a real netsh call
     dnsExports.verifyTeredoDisabled = () => true;
+    dnsExports.verifyDNSAsync = async () => dnsExports.verifyDNS();
   });
 
   after(() => {
     dnsExports.verifyDNS          = savedVerifyDNS;
+    dnsExports.verifyDNSAsync     = savedVerifyDNSAsync;
     dnsExports.verifyTeredoDisabled = savedVerifyTeredoDisabled;
   });
 
@@ -234,7 +249,9 @@ describe('Watchdog vector logic — integrity vs filtering', () => {
 // --------------------------------------------------------------------------
 describe('NetworkWatch re-lockdown trigger logic', () => {
   let savedVerifyDNS;
-  let applyDNSCalled;
+  let savedVerifyDNSAsync;
+  let lockdownCalled;
+  let savedRunLockdown;
   let savedApplyDNS;
   let savedNodeEnv;
 
@@ -245,16 +262,22 @@ describe('NetworkWatch re-lockdown trigger logic', () => {
     saveChallengeState({ status: 'active', id: 'test-challenge' });
 
     savedVerifyDNS = dnsExports.verifyDNS;
+    savedVerifyDNSAsync = dnsExports.verifyDNSAsync;
+    dnsExports.verifyDNSAsync = async () => dnsExports.verifyDNS();
+    savedRunLockdown = netwatch.runLockdown;
+    netwatch.runLockdown = async (reason) => {
+      lockdownCalled = true;
+      return { ok: true, reason };
+    };
     savedApplyDNS  = dnsExports.applyDNS;
     // Stub applyDNS globally — runLockdown calls it via the same cached exports
-    dnsExports.applyDNS = () => {
-      applyDNSCalled = true;
-      return { applied: [], failed: [] };
-    };
+    dnsExports.applyDNS = () => ({ applied: [], failed: [] });
   });
 
   after(() => {
     dnsExports.verifyDNS = savedVerifyDNS;
+    dnsExports.verifyDNSAsync = savedVerifyDNSAsync;
+    netwatch.runLockdown = savedRunLockdown;
     dnsExports.applyDNS  = savedApplyDNS;
     process.env.NODE_ENV = savedNodeEnv;
     const { saveChallengeState } = require('../../../challengeState');
@@ -262,7 +285,7 @@ describe('NetworkWatch re-lockdown trigger logic', () => {
   });
 
   beforeEach(() => {
-    applyDNSCalled = false;
+    lockdownCalled = false;
   });
 
   it('Filtering failure alone must NOT trigger lockdown', async () => {
@@ -281,9 +304,9 @@ describe('NetworkWatch re-lockdown trigger logic', () => {
     stop();
 
     assert.strictEqual(
-      applyDNSCalled,
+      lockdownCalled,
       false,
-      'applyDNS should NOT be called for a filtering-only failure',
+      'runLockdown should NOT be called for a filtering-only failure',
     );
   });
 
@@ -303,9 +326,9 @@ describe('NetworkWatch re-lockdown trigger logic', () => {
     stop();
 
     assert.strictEqual(
-      applyDNSCalled,
+      lockdownCalled,
       true,
-      'applyDNS should be called for a config integrity compromise',
+      'runLockdown should be called for a config integrity compromise',
     );
   });
 });

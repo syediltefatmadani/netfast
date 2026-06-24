@@ -4,7 +4,7 @@ const { DohClient } = require('./DohClient');
 
 const { DnsStatus, mapFinalStatusToDnsStatus } = require('./DnsStatus');
 
-const { FILTER_TESTS } = require('./filterTests');
+const { FILTER_TESTS, RUNTIME_SKIP_ADULT_POLICY_PROBES } = require('./filterTests');
 
 const { pingCleanBrowsingDoH, queryCleanBrowsingDoH } = require('./dohHealth');
 
@@ -25,6 +25,10 @@ const POLICY_TEST_DOMAINS = [
   ...FILTER_TESTS.providerMissCandidates,
 
 ];
+
+const SKIPPED_POLICY = { results: [], failures: [], ok: true, skipped: true };
+
+const SKIPPED_CONSISTENCY = { mismatches: [], ok: true, skipped: true };
 
 
 
@@ -256,7 +260,9 @@ try {
 
 
 
-  async runPolicyTests() {
+  async runPolicyTests({ skipAdultDomainProbes = RUNTIME_SKIP_ADULT_POLICY_PROBES } = {}) {
+
+    if (skipAdultDomainProbes) return SKIPPED_POLICY;
 
     const results = [];
 
@@ -280,7 +286,9 @@ try {
 
 
 
-  async runConsistencyTests() {
+  async runConsistencyTests({ skipAdultDomainProbes = RUNTIME_SKIP_ADULT_POLICY_PROBES } = {}) {
+
+    if (skipAdultDomainProbes) return SKIPPED_CONSISTENCY;
 
     const mismatches = [];
 
@@ -354,19 +362,24 @@ try {
 
    */
 
-  async runFullValidation() {
+  async runFullValidation({ skipAdultDomainProbes = RUNTIME_SKIP_ADULT_POLICY_PROBES } = {}) {
 
     try {
 
-      const summary = await runDohHealthSummary({ dohClient: this.doh });
+      const summary = await runDohHealthSummary({
+        dohClient: this.doh,
+        skipAdultDomainProbes,
+      });
 
       const status = mapFinalStatusToDnsStatus(summary.finalStatus);
 
-
+      const policyOpts = { skipAdultDomainProbes };
 
       const detailsByStatus = {
 
-        [DnsStatus.HEALTHY]: 'DoH reachable; known adult domains blocked by CleanBrowsing',
+        [DnsStatus.HEALTHY]: skipAdultDomainProbes
+          ? 'DoH reachable; safe domains allowed (adult probes skipped at runtime)'
+          : 'DoH reachable; known adult domains blocked by CleanBrowsing',
 
         [DnsStatus.HEALTHY_WITH_PROVIDER_MISSES]:
 
@@ -392,7 +405,7 @@ try {
 
           connectivity: { ok: summary.dohReachable, reachable: summary.dohReachable },
 
-          policy: await this.runPolicyTests(),
+          policy: await this.runPolicyTests(policyOpts),
 
           consistency: null,
 
@@ -406,9 +419,9 @@ try {
 
       if (!summary.dohReachable) {
 
-        const policy = await this.runPolicyTests();
+        const policy = await this.runPolicyTests(policyOpts);
 
-        const stillProtected = policy.ok;
+        const stillProtected = policy.skipped || policy.ok;
 
         return {
 
@@ -434,7 +447,7 @@ try {
 
 
 
-      const consistency = await this.runConsistencyTests();
+      const consistency = await this.runConsistencyTests(policyOpts);
 
       if (!consistency.ok) {
 
@@ -450,7 +463,7 @@ try {
 
             connectivity: { ok: true, reachable: true },
 
-            policy: await this.runPolicyTests(),
+            policy: await this.runPolicyTests(policyOpts),
 
             consistency,
 
@@ -464,7 +477,7 @@ try {
 
 
 
-      if (!summary.knownAdultBlockedByDoh) {
+      if (!skipAdultDomainProbes && !summary.knownAdultBlockedByDoh) {
 
         const failedAdult = summary.adultResults
 
@@ -480,7 +493,7 @@ try {
 
           connectivity: { ok: true, reachable: true },
 
-          policy: await this.runPolicyTests(),
+          policy: await this.runPolicyTests(policyOpts),
 
           consistency,
 
@@ -502,7 +515,7 @@ try {
 
           connectivity: { ok: true, reachable: true },
 
-          policy: await this.runPolicyTests(),
+          policy: await this.runPolicyTests(policyOpts),
 
           consistency,
 
@@ -522,7 +535,7 @@ try {
 
         connectivity: { ok: true, reachable: true },
 
-        policy: await this.runPolicyTests(),
+        policy: await this.runPolicyTests(policyOpts),
 
         consistency,
 

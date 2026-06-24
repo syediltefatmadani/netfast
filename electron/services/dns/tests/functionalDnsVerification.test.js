@@ -1,8 +1,15 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { classifyBlockedDomainTest } = require('../../../functionalDnsVerification');
+const {
+  classifyBlockedDomainTest,
+  RUNTIME_FUNCTIONAL_BLOCKED_DOMAINS,
+} = require('../../../functionalDnsVerification');
 
 describe('functionalDnsVerification', () => {
+  it('uses reddit.com as the only runtime blocked-domain probe', () => {
+    assert.deepStrictEqual(RUNTIME_FUNCTIONAL_BLOCKED_DOMAINS, ['reddit.com']);
+  });
+
   it('treats NXDOMAIN as blocked', () => {
     const result = classifyBlockedDomainTest('reddit.com', {
       ok: false,

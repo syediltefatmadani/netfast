@@ -51,7 +51,7 @@ export default function ViolationLog() {
   const [vectorFilter, setVectorFilter] = useState('all');
   const [query, setQuery] = useState('');
 
-  useEffect(() => { if (!violationLog?.length) loadAll(); }, [loadAll, violationLog]);
+  useEffect(() => { loadAll(); }, [loadAll]);
 
   const counts = useMemo(() => {
     const c = { total: 0, critical: 0, warning: 0 };

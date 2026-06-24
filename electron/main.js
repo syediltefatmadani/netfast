@@ -64,6 +64,22 @@ let lastLoadedUrl = null;
 
 
 
+/** Bring the existing window to the foreground (restore if minimized, focus). */
+
+function restoreMainWindow() {
+
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+
+  if (mainWindow.isMinimized()) mainWindow.restore();
+
+  if (!mainWindow.isVisible()) mainWindow.show();
+
+  mainWindow.focus();
+
+}
+
+
+
 const RELOAD_COOLDOWN_MS = 5000;
 
 let lastReloadAt = 0;
@@ -201,6 +217,19 @@ async function createWindow() {
     titleBarStyle: 'hiddenInset',
 
     backgroundColor: '#0a0a0f',
+
+    show: false,
+
+  });
+
+
+
+  // Show only once the renderer has painted so a half-initialized window can't
+  // get stuck off-screen / unfocusable when the main process is briefly busy.
+
+  mainWindow.once('ready-to-show', () => {
+
+    restoreMainWindow();
 
   });
 
@@ -395,23 +424,44 @@ async function runBackgroundLockdown() {
 
 
 
-app.whenReady().then(async () => {
-  logPolicyModeStartup();
-  logger.info('STARTUP', 'NetFast Electron ready', { mode: getPolicyMode() });
+// Single-instance: clicking the taskbar/exe again must focus the running window
+// instead of spawning a second process that fights over enforcement and ports.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
-  const windowTimer = createPhaseTimer('window-creation');
-  await createWindow();
-  windowTimer.end();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    logger.info('WINDOW', 'Second instance launched — focusing existing window');
+    restoreMainWindow();
+  });
 
-  const challenge = await getSavedChallengeState();
-  if (shouldRunStartupLockdown(challenge) && !isEnforcementDisabled()) {
-    setEnforcementInProgress(true);
-  }
+  app.on('activate', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      createWindow();
+    } else {
+      restoreMainWindow();
+    }
+  });
 
-  setTimeout(() => {
-    runBackgroundLockdown();
-  }, 250);
-});
+  app.whenReady().then(async () => {
+    logPolicyModeStartup();
+    logger.info('STARTUP', 'NetFast Electron ready', { mode: getPolicyMode() });
+
+    const windowTimer = createPhaseTimer('window-creation');
+    await createWindow();
+    windowTimer.end();
+
+    const challenge = await getSavedChallengeState();
+    if (shouldRunStartupLockdown(challenge) && !isEnforcementDisabled()) {
+      setEnforcementInProgress(true);
+    }
+
+    setTimeout(() => {
+      runBackgroundLockdown();
+    }, 250);
+  });
+}
 
 
 

@@ -22,7 +22,7 @@ export default function Termination() {
   const [appealText, setAppealText] = useState('');
   const [submitted, setSubmitted] = useState(false);
 
-  useEffect(() => { if (!violationLog?.length) loadAll(); }, [loadAll, violationLog]);
+  useEffect(() => { loadAll(); }, [loadAll]);
 
   const terminationVector = violationLog?.[violationLog.length - 1]?.vector || 'firefox_doh';
 

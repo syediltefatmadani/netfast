@@ -14,33 +14,40 @@ export const useChallengeStore = create((set, get) => ({
   reapplyLoading: false,
   reapplyError: null,
   _vectorsInFlight: false,
+  _loadAllInFlight: false,
 
   loadAll: async (challengeId) => {
+    if (get()._loadAllInFlight) return;
+    set({ _loadAllInFlight: true });
     const id = challengeId || localStorage.getItem('fl_challenge_id');
     if (!id) {
-      set({ isLoading: false });
+      set({ isLoading: false, _loadAllInFlight: false });
       return;
     }
     set({ isLoading: true });
-    const context = buildVpnContext(id);
-    const [challenge, vectorStatus, dnsStatus, violationLog, vpnRuntime] = await Promise.all([
-      getChallenge(id),
-      electronBridge.getVectorStatus(context),
-      electronBridge.getDNSStatus(),
-      getViolationLog(id),
-      electronBridge.getVpnChallengeState(context),
-    ]);
-    await get().syncVpnBackendReport(id, vpnRuntime);
-    await electronBridge.syncChallengeState(challenge).catch(() => {});
-    set({
-      challenge,
-      vectorStatus,
-      dnsStatus,
-      violationLog,
-      vpnRuntime,
-      isLoading: false,
-      lastCheckedAt: Date.now(),
-    });
+    try {
+      const context = buildVpnContext(id);
+      const [challenge, vectorStatus, dnsStatus, violationLog, vpnRuntime] = await Promise.all([
+        getChallenge(id),
+        electronBridge.getVectorStatus(context),
+        electronBridge.getDNSStatus(),
+        getViolationLog(id),
+        electronBridge.getVpnChallengeState(context),
+      ]);
+      await get().syncVpnBackendReport(id, vpnRuntime);
+      await electronBridge.syncChallengeState(challenge).catch(() => {});
+      set({
+        challenge,
+        vectorStatus,
+        dnsStatus,
+        violationLog,
+        vpnRuntime,
+        isLoading: false,
+        lastCheckedAt: Date.now(),
+      });
+    } finally {
+      set({ _loadAllInFlight: false });
+    }
   },
 
   refreshVectors: async () => {

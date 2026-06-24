@@ -5,6 +5,12 @@ const FILTER_TESTS = {
   providerMissCandidates: ['pornhat.com', 'pornhat.one'],
 };
 
+/** Live blocked-domain probes for app runtime (IPC, verifyDNS) — slow adult domains omitted. */
+const RUNTIME_FUNCTIONAL_BLOCKED_DOMAINS = ['reddit.com'];
+
+/** Skip slow adult DoH/system probes during normal app operation; CLI diagnostics use full lists. */
+const RUNTIME_SKIP_ADULT_POLICY_PROBES = true;
+
 const DOH_FAMILY_BASE = 'https://doh.cleanbrowsing.org/doh/family-filter';
 const DOH_WIRE_URL = `${DOH_FAMILY_BASE}/dns-query`;
 
@@ -22,6 +28,8 @@ function expandDomainVariants(domain) {
 
 module.exports = {
   FILTER_TESTS,
+  RUNTIME_FUNCTIONAL_BLOCKED_DOMAINS,
+  RUNTIME_SKIP_ADULT_POLICY_PROBES,
   DOH_FAMILY_BASE,
   DOH_WIRE_URL,
   DOH_REACHABLE_HTTP_STATUSES,

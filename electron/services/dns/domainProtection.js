@@ -1,5 +1,5 @@
 const { queryCleanBrowsingDoH, pingCleanBrowsingDoH } = require('./dohHealth');
-const { FILTER_TESTS, expandDomainVariants } = require('./filterTests');
+const { FILTER_TESTS, expandDomainVariants, RUNTIME_SKIP_ADULT_POLICY_PROBES } = require('./filterTests');
 
 const STATUS_MESSAGES = {
   blocked_by_doh: 'Blocked by CleanBrowsing DoH',
@@ -281,6 +281,8 @@ function formatDomainStatusMessage(evaluation) {
 }
 
 async function runDohHealthSummary(opts = {}) {
+  const skipAdultDomainProbes =
+    opts.skipAdultDomainProbes ?? RUNTIME_SKIP_ADULT_POLICY_PROBES;
   const ping = await pingCleanBrowsingDoH(opts);
   const dohReachable = ping.reachable === true;
 
@@ -296,55 +298,63 @@ async function runDohHealthSummary(opts = {}) {
   }
 
   const adultResults = [];
-  for (const domain of FILTER_TESTS.knownAdultBlocked) {
-    adultResults.push(
-      await evaluateDomainProtection(domain, {
-        expectedRestricted: true,
-        category: 'adult',
-        checkHttps: false,
-        applyFallbackOnMiss: false,
-        dohClient: opts.dohClient,
-      }),
-    );
-  }
-
   const missResults = [];
-  for (const domain of FILTER_TESTS.providerMissCandidates) {
-    missResults.push(
-      await evaluateDomainProtection(domain, {
-        expectedRestricted: true,
-        category: 'adult',
-        checkHttps: true,
-        applyFallbackOnMiss: useHostsBlockEnabled(),
-        dohClient: opts.dohClient,
-      }),
-    );
+  if (!skipAdultDomainProbes) {
+    for (const domain of FILTER_TESTS.knownAdultBlocked) {
+      adultResults.push(
+        await evaluateDomainProtection(domain, {
+          expectedRestricted: true,
+          category: 'adult',
+          checkHttps: false,
+          applyFallbackOnMiss: false,
+          dohClient: opts.dohClient,
+        }),
+      );
+    }
+
+    for (const domain of FILTER_TESTS.providerMissCandidates) {
+      missResults.push(
+        await evaluateDomainProtection(domain, {
+          expectedRestricted: true,
+          category: 'adult',
+          checkHttps: true,
+          applyFallbackOnMiss: useHostsBlockEnabled(),
+          dohClient: opts.dohClient,
+        }),
+      );
+    }
   }
 
   const safeDomainAllowed = safeResults.every(
     (r) => r.dohReachable && r.status === 'allowed' && !r.dohBlocked,
   );
-  const knownAdultBlockedByDoh = adultResults.every(
-    (r) => r.dohBlocked && r.status === 'blocked_by_doh',
-  );
+  const knownAdultBlockedByDoh = skipAdultDomainProbes
+    ? dohReachable && safeDomainAllowed
+    : adultResults.every((r) => r.dohBlocked && r.status === 'blocked_by_doh');
 
   const providerMisses = missResults.filter((r) => r.providerMiss).map((r) => r.domain);
   const fallbackBlockedMisses = missResults.filter(
     (r) => r.providerMiss && r.finalBlocked && r.status === 'blocked_by_fallback',
   );
-  const criticalUnblockedRestrictedDomains = [
-    ...adultResults.filter((r) => !r.finalBlocked).map((r) => r.domain),
-    ...missResults.filter((r) => r.providerMiss && !r.finalBlocked).map((r) => r.domain),
-  ];
+  const criticalUnblockedRestrictedDomains = skipAdultDomainProbes
+    ? []
+    : [
+        ...adultResults.filter((r) => !r.finalBlocked).map((r) => r.domain),
+        ...missResults.filter((r) => r.providerMiss && !r.finalBlocked).map((r) => r.domain),
+      ];
 
   let finalStatus = 'failed';
   if (criticalUnblockedRestrictedDomains.length > 0) {
     finalStatus = 'failed';
   } else if (!dohReachable) {
-    const restrictedStillBlocked =
-      adultResults.every((r) => r.finalBlocked) &&
-      missResults.every((r) => !r.providerMiss || r.finalBlocked);
-    finalStatus = restrictedStillBlocked ? 'degraded' : 'failed';
+    if (skipAdultDomainProbes) {
+      finalStatus = safeDomainAllowed ? 'degraded' : 'failed';
+    } else {
+      const restrictedStillBlocked =
+        adultResults.every((r) => r.finalBlocked) &&
+        missResults.every((r) => !r.providerMiss || r.finalBlocked);
+      finalStatus = restrictedStillBlocked ? 'degraded' : 'failed';
+    }
   } else if (knownAdultBlockedByDoh && safeDomainAllowed) {
     if (providerMisses.length === 0) {
       finalStatus = 'healthy';
@@ -369,6 +379,7 @@ async function runDohHealthSummary(opts = {}) {
     fallbackBlockedMisses: fallbackBlockedMisses.map((r) => r.domain),
     criticalUnblockedRestrictedDomains,
     finalStatus,
+    skipAdultDomainProbes,
     safeResults,
     adultResults,
     missResults,

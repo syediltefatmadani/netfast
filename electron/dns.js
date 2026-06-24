@@ -481,90 +481,101 @@ function verifyDnsFailureResult() {
 function buildVerifyDnsResult({ audit, dohConfigured, fw, functional, strictMode }) {
   const firewallLocked = fw.firewallLocked;
   const ipv4ConfigLocked = audit.ipv4Locked;
-    const ipv6ConfigLocked = strictMode ? ipv4ConfigLocked : audit.ipv6Locked;
-    const functionalDnsProtection = functional.functionalDnsProtection;
-    const dnsApplied = functionalDnsProtection;
-    const rogueServers = audit.rogueServers;
-    const dnsIntegrity = functionalDnsProtection && firewallLocked;
+  const ipv6ConfigLocked = strictMode ? ipv4ConfigLocked : audit.ipv6Locked;
+  const configInferredProtection =
+    fw.firewallCoreLocked && ipv4ConfigLocked && dohConfigured;
+  const functionalDnsProtection = functional.functionalDnsProtection;
+  const dnsApplied = functionalDnsProtection;
+  const rogueServers = audit.rogueServers;
+  const dnsIntegrity = functionalDnsProtection && firewallLocked;
 
-    const { getDnsHealthMonitor, isProtectionActive } = require('./services/dns');
-    const health = getDnsHealthMonitor().getLastReport();
-    const probes =
-      health?.validation?.policy?.results?.map((r) => {
-        const ev = r.evaluation;
-        return {
-          domain: r.domain,
-          label: ev?.providerMiss
-            ? 'Provider miss (DoH allowed, fallback may block)'
-            : 'CleanBrowsing family filter (DoH)',
-          blocked: ev?.finalBlocked ?? r.ok,
-          dohBlocked: ev?.dohBlocked ?? false,
-          providerMiss: ev?.providerMiss ?? false,
-          blockedBy: ev?.blockedBy ?? (r.ok ? ['cleanbrowsing_doh'] : []),
-          status: ev?.status ?? r.reason,
-          channel: 'doh',
-        };
-      }) || [];
+  const { getDnsHealthMonitor, isProtectionActive } = require('./services/dns');
+  const health = getDnsHealthMonitor().getLastReport();
+  const healthSkippedAdult = health?.summary?.skipAdultDomainProbes === true;
+  const healthActive = health ? isProtectionActive(health.status) : false;
+  const redditProbeOk =
+    functional.blockedDomainTests.length === 0 || functional.functionalDnsProtection;
+  const filteringActive =
+    functionalDnsProtection ||
+    healthActive ||
+    (healthSkippedAdult && configInferredProtection && redditProbeOk);
+  const probes =
+    health?.validation?.policy?.results?.map((r) => {
+      const ev = r.evaluation;
+      return {
+        domain: r.domain,
+        label: ev?.providerMiss
+          ? 'Provider miss (DoH allowed, fallback may block)'
+          : 'CleanBrowsing family filter (DoH)',
+        blocked: ev?.finalBlocked ?? r.ok,
+        dohBlocked: ev?.dohBlocked ?? false,
+        providerMiss: ev?.providerMiss ?? false,
+        blockedBy: ev?.blockedBy ?? (r.ok ? ['cleanbrowsing_doh'] : []),
+        status: ev?.status ?? r.reason,
+        channel: 'doh',
+      };
+    }) || [];
 
-    const result = {
-      dnsApplied,
-      ipv4Locked: ipv4ConfigLocked,
-      ipv6Locked: ipv6ConfigLocked,
-      ipv4ConfigLocked,
-      ipv6ConfigLocked,
-      functionalDnsProtection,
+  const result = {
+    dnsApplied,
+    ipv4Locked: ipv4ConfigLocked,
+    ipv6Locked: ipv6ConfigLocked,
+    ipv4ConfigLocked,
+    ipv6ConfigLocked,
+    functionalDnsProtection,
+    blockedDomainTests: functional.blockedDomainTests,
+    strictMode,
+    firewallLocked,
+    firewallCoreLocked: fw.firewallCoreLocked,
+    bypassResolversBlocked: fw.bypassResolversBlocked,
+    rogueServers,
+    dnsIntegrity,
+    dohConfigured,
+    firewallIntact: firewallLocked,
+    rogueDns: rogueServers,
+    filteringActive,
+    blockedDomains: functional.blockedDomainTests.filter((t) => t.blocked).map((t) => t.domain),
+    unblockedDomains: functional.blockedDomainTests.filter((t) => !t.blocked).map((t) => t.domain),
+    ipv4: { intact: ipv4ConfigLocked, servers: audit.interfaces, rogue: rogueServers },
+    ipv6: { intact: ipv6ConfigLocked, servers: audit.interfaces, rogue: rogueServers },
+    expected: DNS,
+    probes,
+    audit,
+    functionalVerification: functional,
+    dnsHealth: health
+      ? {
+          status: health.status,
+          finalStatus: health.finalStatus,
+          providerMisses: health.providerMisses,
+          protectionLabel: health.protectionLabel,
+        }
+      : null,
+  };
+
+  if (rogueServers.length) {
+    logger.warn('DNS', 'Rogue DNS servers detected (informational)', rogueServers);
+  }
+  if (!ipv6ConfigLocked) {
+    logger.warn('DNS', 'IPv6 adapter DNS is not set to CleanBrowsing (informational)');
+  }
+  if (!functionalDnsProtection && !filteringActive) {
+    logger.error('DNS', 'Functional DNS filtering failed — blocked domains are resolving', {
       blockedDomainTests: functional.blockedDomainTests,
-      strictMode,
-      firewallLocked,
-      firewallCoreLocked: fw.firewallCoreLocked,
-      bypassResolversBlocked: fw.bypassResolversBlocked,
-      rogueServers,
-      dnsIntegrity,
-      dohConfigured,
-      firewallIntact: firewallLocked,
-      rogueDns: rogueServers,
-      filteringActive: functionalDnsProtection || (health ? isProtectionActive(health.status) : false),
-      blockedDomains: functional.blockedDomainTests.filter((t) => t.blocked).map((t) => t.domain),
-      unblockedDomains: functional.blockedDomainTests.filter((t) => !t.blocked).map((t) => t.domain),
-      ipv4: { intact: ipv4ConfigLocked, servers: audit.interfaces, rogue: rogueServers },
-      ipv6: { intact: ipv6ConfigLocked, servers: audit.interfaces, rogue: rogueServers },
-      expected: DNS,
-      probes,
-      audit,
-      functionalVerification: functional,
-      dnsHealth: health
-        ? {
-            status: health.status,
-            finalStatus: health.finalStatus,
-            providerMisses: health.providerMisses,
-            protectionLabel: health.protectionLabel,
-          }
-        : null,
-    };
-
-    if (rogueServers.length) {
-      logger.warn('DNS', 'Rogue DNS servers detected (informational)', rogueServers);
-    }
-    if (!ipv6ConfigLocked) {
-      logger.warn('DNS', 'IPv6 adapter DNS is not set to CleanBrowsing (informational)');
-    }
-    if (!functionalDnsProtection) {
-      logger.error('DNS', 'Functional DNS filtering failed — blocked domains are resolving', {
-        blockedDomainTests: functional.blockedDomainTests,
-      });
-    }
-    logger.info('DNS', 'Verify DNS', {
-      dnsApplied,
-      functionalDnsProtection,
-      ipv4ConfigLocked,
-      ipv6ConfigLocked,
-      strictMode,
-      firewallLocked,
-      dnsIntegrity,
-      dohConfigured,
-      rogueCount: rogueServers.length,
     });
-    return result;
+  }
+  logger.info('DNS', 'Verify DNS', {
+    dnsApplied,
+    functionalDnsProtection,
+    filteringActive,
+    ipv4ConfigLocked,
+    ipv6ConfigLocked,
+    strictMode,
+    firewallLocked,
+    dnsIntegrity,
+    dohConfigured,
+    rogueCount: rogueServers.length,
+  });
+  return result;
 }
 
 function verifyDNS() {

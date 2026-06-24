@@ -6,8 +6,9 @@ const {
   isRealPublicIpv4,
   isRealPublicIpv6,
 } = require('./networkEnforcement');
+const { RUNTIME_FUNCTIONAL_BLOCKED_DOMAINS } = require('./services/dns/filterTests');
 
-/** Domains that must not resolve when family filtering is active. */
+/** Full diagnostic list (all slow adult domains) — use only for explicit CLI/manual tests. */
 const FUNCTIONAL_BLOCKED_DOMAINS = ['reddit.com', 'pornhat.one', 'xvideos.com'];
 
 const CACHE_MS = 30000;
@@ -71,7 +72,11 @@ function classifyBlockedDomainTest(domain, resolveResult) {
   };
 }
 
-function runFunctionalDnsVerification({ timeoutSec = 8, domains = FUNCTIONAL_BLOCKED_DOMAINS, force = false } = {}) {
+function runFunctionalDnsVerification({
+  timeoutSec = 8,
+  domains = RUNTIME_FUNCTIONAL_BLOCKED_DOMAINS,
+  force = false,
+} = {}) {
   if (!force && cachedResult && Date.now() - cachedAt < CACHE_MS) {
     return cachedResult;
   }
@@ -85,7 +90,7 @@ function runFunctionalDnsVerification({ timeoutSec = 8, domains = FUNCTIONAL_BLO
   return buildFunctionalResult(blockedDomainTests);
 }
 
-function buildFunctionalResult(blockedDomainTests) {
+function buildFunctionalResult(blockedDomainTests, { runtimeMode = true } = {}) {
   const functionalDnsProtection =
     blockedDomainTests.length > 0 && blockedDomainTests.every((t) => t.blocked);
 
@@ -94,6 +99,8 @@ function buildFunctionalResult(blockedDomainTests) {
     blockedDomainTests,
     passed: functionalDnsProtection,
     testedAt: Date.now(),
+    runtimeMode,
+    skippedAdultProbes: runtimeMode,
   };
 
   logger.info('DNS', 'Functional DNS verification', {
@@ -109,7 +116,7 @@ function buildFunctionalResult(blockedDomainTests) {
 /** Non-blocking variant — resolves the probe domains off the main thread. */
 async function runFunctionalDnsVerificationAsync({
   timeoutSec = 8,
-  domains = FUNCTIONAL_BLOCKED_DOMAINS,
+  domains = RUNTIME_FUNCTIONAL_BLOCKED_DOMAINS,
   force = false,
 } = {}) {
   if (!force && cachedResult && Date.now() - cachedAt < CACHE_MS) {
@@ -132,6 +139,7 @@ function invalidateFunctionalDnsCache() {
 
 module.exports = {
   FUNCTIONAL_BLOCKED_DOMAINS,
+  RUNTIME_FUNCTIONAL_BLOCKED_DOMAINS,
   classifyBlockedDomainTest,
   runFunctionalDnsVerification,
   runFunctionalDnsVerificationAsync,

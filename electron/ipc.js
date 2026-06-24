@@ -92,14 +92,32 @@ function buildProtectionUiStatus(config, health) {
   const warnings = [];
   const errors = [];
 
+  const skippedAdultProbes =
+    config.functionalVerification?.skippedAdultProbes === true ||
+    health?.summary?.skipAdultDomainProbes === true;
+  const configInferredProtection =
+    config.firewallCoreLocked && config.ipv4Locked && config.dohConfigured;
+  const redditProbeOk =
+    !config.functionalVerification?.blockedDomainTests?.length ||
+    config.functionalDnsProtection;
+
   if (!config.ipv4Locked) {
     warnings.push('Adapter IPv4 DNS is not set to CleanBrowsing (informational)');
   }
   if (!config.ipv6Locked) {
     warnings.push('Adapter IPv6 DNS is not set to CleanBrowsing (informational)');
   }
+  const filteringOk =
+    config.filteringActive === true ||
+    config.functionalDnsProtection === true ||
+    (health ? isProtectionActive(health.status) : false) ||
+    (skippedAdultProbes && configInferredProtection && redditProbeOk);
   if (!config.functionalDnsProtection) {
-    errors.push('DNS filtering not active — blocked domains are resolving');
+    if (skippedAdultProbes && configInferredProtection && redditProbeOk) {
+      warnings.push('Adult domain probes skipped in runtime mode');
+    } else if (!filteringOk) {
+      errors.push('DNS filtering not active — blocked domains are resolving');
+    }
   }
   if (!config.firewallLocked) {
     errors.push(config.error || 'DNS firewall is not fully locked');
@@ -145,10 +163,9 @@ function buildProtectionUiStatus(config, health) {
   if (health?.finalStatus === 'healthy_with_provider_misses') {
     warnings.push('DoH primary working; provider misses caught by fallback');
   }
-  const filteringOk =
+  const dnsLocked =
     config.functionalDnsProtection === true ||
-    (health ? isProtectionActive(health.status) : false);
-  const dnsLocked = config.functionalDnsProtection === true;
+    (skippedAdultProbes && configInferredProtection && redditProbeOk);
   const coreOk =
     dnsLocked &&
     config.firewallLocked &&

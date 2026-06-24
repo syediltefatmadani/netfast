@@ -55,7 +55,7 @@ async function main() {
   const { cmd, domain, flags } = parseArgs(process.argv);
 
   if (cmd === 'health-doh') {
-    const summary = await runDohHealthSummary();
+    const summary = await runDohHealthSummary({ skipAdultDomainProbes: false });
     console.log(JSON.stringify(summary, null, 2));
     console.log('\n--- Summary ---');
     console.log(`DoH endpoint reachable: ${summary.dohReachable}`);

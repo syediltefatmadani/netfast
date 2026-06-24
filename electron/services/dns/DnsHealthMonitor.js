@@ -16,7 +16,7 @@ const { DnsValidator } = require('./DnsValidator');
 
 const { DnsAuditLogger } = require('./DnsAuditLogger');
 
-const { runEncoded } = require('../../powershell');
+const { runEncodedAsync } = require('../../powershell');
 
 
 
@@ -24,11 +24,11 @@ const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
 
 
-function getActiveNetworkName() {
+async function getActiveNetworkName() {
 
   try {
 
-    const out = runEncoded(`
+    const out = await runEncodedAsync(`
 
 $if = Get-NetConnectionProfile -ErrorAction SilentlyContinue | Where-Object { $_.IPv4Connectivity -ne 'Disconnected' } | Select-Object -First 1
 
@@ -80,11 +80,13 @@ class DnsHealthMonitor {
 
     this.running = true;
 
-    const networkName = getActiveNetworkName();
+    const networkName = await getActiveNetworkName();
 
     try {
 
-      const validation = await this.validator.runFullValidation();
+      const validation = await this.validator.runFullValidation({
+        skipAdultDomainProbes: true,
+      });
 
       const summary = validation.summary || {};
 

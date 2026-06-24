@@ -74,7 +74,7 @@ describe('DnsValidator.runFullValidation', () => {
 
     });
 
-    const result = await validator.runFullValidation();
+    const result = await validator.runFullValidation({ skipAdultDomainProbes: false });
     assert.ok(
       result.status === DnsStatus.FAILED || result.status === DnsStatus.FILTERING_INACTIVE,
     );
@@ -102,7 +102,7 @@ describe('DnsValidator.runFullValidation', () => {
 
     });
 
-    const result = await validator.runFullValidation();
+    const result = await validator.runFullValidation({ skipAdultDomainProbes: false });
 
     assert.ok(
 
@@ -112,6 +112,32 @@ describe('DnsValidator.runFullValidation', () => {
 
     );
 
+  });
+
+  it('skips adult policy probes at runtime and returns HEALTHY when DoH and safe domains pass', async () => {
+    let adultQueried = false;
+    const validator = new DnsValidator({
+      dohClient: mockDohClient({
+        query: async (domain) => {
+          if (domain.includes('pornhub') || domain.includes('xvideos') || domain.includes('pornhat')) {
+            adultQueried = true;
+          }
+          return { rcode: 0, answers: [{ type: 1, value: '8.8.8.8' }] };
+        },
+      }),
+    });
+
+    const policy = await validator.runPolicyTests({ skipAdultDomainProbes: true });
+    assert.equal(policy.skipped, true);
+    assert.equal(policy.ok, true);
+
+    const result = await validator.runFullValidation({ skipAdultDomainProbes: true });
+    assert.equal(adultQueried, false);
+    assert.equal(result.summary.skipAdultDomainProbes, true);
+    assert.ok(
+      result.status === DnsStatus.HEALTHY ||
+        result.status === DnsStatus.HEALTHY_WITH_PROVIDER_MISSES,
+    );
   });
 
 });

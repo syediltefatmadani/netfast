@@ -1,5 +1,5 @@
 const logger = require('./logger');
-const { runEncoded } = require('./powershell');
+const { runEncoded, runEncodedAsync } = require('./powershell');
 const dnsModule = require('./dns');
 const { getDnsHealthMonitor } = require('./services/dns');
 const {
@@ -28,15 +28,51 @@ const {
   getLastMongoDiagnostic,
 } = require('./mongoDns');
 const { runLockdownInWorker } = require('./lockdownRunner');
-const { invalidateDnsStatusCache, getVerifyDnsCached } = require('./dnsStatusCache');
+const { invalidateDnsStatusCache } = require('./dnsStatusCache');
 
 let activeLockdown = null;
 let lastWatchLockdownAt = 0;
 const WATCH_LOCKDOWN_COOLDOWN_MS = 60000;
 
+// Event-driven detection (tamperWatch) provides the fast path now, so the timer
+// is only a safety-net backstop. If the event sensor fails, we drop back to the
+// fast interval so detection coverage is never lost.
+const BACKSTOP_INTERVAL_MS = 5 * 60 * 1000;
+const FAST_FALLBACK_INTERVAL_MS = 30000;
+
+let watchLast = null;
+let watchTimer = null;
+let watchActive = false;
+
 function getNetworkFingerprint() {
   try {
     const out = runEncoded(`
+$gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1).NextHop
+$ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -ne 'WellKnown' -and $_.IPAddress -notlike '127.*' } | Select-Object -First 1).IPAddress
+$dns = (Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ServerAddresses) -join ','
+$adapters = (Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | Select-Object -ExpandProperty Name) -join ','
+[PSCustomObject]@{ gw = $gw; ip = $ip; dns = $dns; adapters = $adapters } | ConvertTo-Json -Compress
+`);
+    const data = JSON.parse(out.trim());
+    const adapterFp = getAdapterFingerprint();
+    return {
+      gateway: data.gw || '',
+      ip: data.ip || '',
+      dns: data.dns || '',
+      adapters: data.adapters || '',
+      adapterFingerprint: adapterFp,
+      key: `${data.gw}|${data.ip}|${data.dns}|${data.adapters}|${adapterFp}`,
+    };
+  } catch (e) {
+    logger.warn('NETWORK', 'Could not read network fingerprint', e.message);
+    return { gateway: '', ip: '', dns: '', adapters: '', adapterFingerprint: '', key: '' };
+  }
+}
+
+/** Non-blocking variant of getNetworkFingerprint for the watch/event path. */
+async function getNetworkFingerprintAsync() {
+  try {
+    const out = await runEncodedAsync(`
 $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1).NextHop
 $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -ne 'WellKnown' -and $_.IPAddress -notlike '127.*' } | Select-Object -First 1).IPAddress
 $dns = (Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ServerAddresses) -join ','
@@ -357,20 +393,19 @@ async function runLockdownInner(reason) {
   };
 }
 
-function startNetworkWatch(intervalMs = 30000) {
-  if (!isRealEnforcementAllowed('network-watch')) {
-    logger.info('DEV_SAFE', 'Network watch disabled — mock/safe mode active');
-    return () => {};
-  }
+/**
+ * One integrity check + conditional re-lockdown. Shared by the backstop timer
+ * (`trigger='poll'`) and the event-driven tamper layer (`trigger='event:*'`).
+ * Uses fresh, non-blocking data (verifyDNSAsync) so the detector is never stale,
+ * and reuses the existing activeLockdown guard + cooldown + runLockdown path.
+ */
+async function runWatchCheck(trigger = 'poll') {
+  const { isEnforcementDisabled } = require('./vpnViolationHandler');
+  if (isEnforcementDisabled() || !isRealEnforcementAllowed('network-watch-tick')) return;
+  if (activeLockdown) return;
 
-  let last = getNetworkFingerprint();
-  logger.info('NETWORK', 'Watching for network/DNS changes', last);
-
-  const timer = setInterval(() => {
-    const { isEnforcementDisabled } = require('./vpnViolationHandler');
-    if (isEnforcementDisabled() || !isRealEnforcementAllowed('network-watch-tick')) return;
-    if (activeLockdown) return;
-
+  // Heavy rule housekeeping only on the slow backstop, not on every event.
+  if (trigger === 'poll') {
     try {
       refreshRuntimeExemptions();
       if (isDeveloperLikeMode()) refreshDeveloperFirewallRules();
@@ -378,53 +413,98 @@ function startNetworkWatch(intervalMs = 30000) {
     } catch (e) {
       logger.warn('NETWORK', 'Runtime exemption refresh failed', e.message);
     }
+  }
 
-    const current = getNetworkFingerprint();
-    const dns = getVerifyDnsCached();
-    const networkChanged = current.key && current.key !== last.key;
+  const [current, dns] = await Promise.all([
+    getNetworkFingerprintAsync(),
+    dnsModule.verifyDNSAsync(),
+  ]);
+  const networkChanged = current.key && watchLast && current.key !== watchLast.key;
 
-    const filteringInactive = !dns.functionalDnsProtection;
-    const rogueDnsDetected = (dns.rogueServers || []).length > 0;
-    const firewallCompromised = !dns.firewallLocked;
+  const filteringInactive = !dns.functionalDnsProtection;
+  const firewallCompromised = !dns.firewallLocked;
+  const configIntegrityViolation = filteringInactive || firewallCompromised;
 
-    const configIntegrityViolation = filteringInactive || firewallCompromised;
+  if (!networkChanged && !configIntegrityViolation) {
+    watchLast = current;
+    return;
+  }
 
-    if (!networkChanged && !configIntegrityViolation) return;
-
-    const now = Date.now();
-    if (activeLockdown) {
-      logger.info('NETWORK', 'Skipping watch re-lockdown — lockdown already running');
-      return;
-    }
-    if (now - lastWatchLockdownAt < WATCH_LOCKDOWN_COOLDOWN_MS) {
-      logger.info('NETWORK', 'Skipping watch re-lockdown — cooldown active', {
-        msSinceLast: now - lastWatchLockdownAt,
-      });
-      return;
-    }
-
-    const reason = networkChanged ? 'network-changed' : 'dns-hijacked';
-
-    logger.warn('NETWORK', 'Re-applying lockdown', {
-      reason,
-      from: last,
-      to: current,
-      rogue: dns.rogueServers,
-      functionalDnsProtection: dns.functionalDnsProtection,
-      firewallCompromised,
+  const now = Date.now();
+  if (activeLockdown) {
+    logger.info('NETWORK', 'Skipping watch re-lockdown — lockdown already running');
+    return;
+  }
+  if (now - lastWatchLockdownAt < WATCH_LOCKDOWN_COOLDOWN_MS) {
+    logger.info('NETWORK', 'Skipping watch re-lockdown — cooldown active', {
+      msSinceLast: now - lastWatchLockdownAt,
     });
-    lastWatchLockdownAt = now;
-    runLockdown(reason).catch((e) => logger.error('NETWORK', 'Lockdown failed', e.message));
-    last = getNetworkFingerprint();
-  }, intervalMs);
+    return;
+  }
 
-  return () => clearInterval(timer);
+  const reason = networkChanged ? 'network-changed' : 'dns-hijacked';
+
+  logger.warn('NETWORK', 'Re-applying lockdown', {
+    trigger,
+    reason,
+    from: watchLast,
+    to: current,
+    rogue: dns.rogueServers,
+    functionalDnsProtection: dns.functionalDnsProtection,
+    firewallCompromised,
+  });
+  lastWatchLockdownAt = now;
+  await runLockdown(reason).catch((e) => logger.error('NETWORK', 'Lockdown failed', e.message));
+  watchLast = await getNetworkFingerprintAsync();
+}
+
+function scheduleWatch(intervalMs) {
+  if (watchTimer) clearInterval(watchTimer);
+  watchTimer = setInterval(() => {
+    runWatchCheck('poll').catch((e) => logger.error('NETWORK', 'Watch check failed', e.message));
+  }, intervalMs);
+}
+
+function startNetworkWatch(intervalMs = BACKSTOP_INTERVAL_MS) {
+  if (!isRealEnforcementAllowed('network-watch')) {
+    logger.info('DEV_SAFE', 'Network watch disabled — mock/safe mode active');
+    return () => {};
+  }
+
+  watchLast = getNetworkFingerprint();
+  watchActive = true;
+  logger.info('NETWORK', 'Watching for network/DNS changes (event-driven + backstop)', {
+    backstopMs: intervalMs,
+    ...watchLast,
+  });
+  scheduleWatch(intervalMs);
+
+  return () => {
+    watchActive = false;
+    if (watchTimer) clearInterval(watchTimer);
+    watchTimer = null;
+  };
+}
+
+/**
+ * Tighten or relax the backstop poll. Called with `true` when the event sensor
+ * is down (revert to fast polling so coverage is preserved) and `false` when
+ * events are healthy again.
+ */
+function setWatchFastFallback(enabled) {
+  if (!watchActive || !watchTimer) return;
+  const target = enabled ? FAST_FALLBACK_INTERVAL_MS : BACKSTOP_INTERVAL_MS;
+  logger.warn('NETWORK', `Watch backstop interval -> ${target}ms (${enabled ? 'event sensor down' : 'events healthy'})`);
+  scheduleWatch(target);
 }
 
 module.exports = {
   getNetworkFingerprint,
+  getNetworkFingerprintAsync,
   runLockdown,
+  runWatchCheck,
   startNetworkWatch,
+  setWatchFastFallback,
   buildLockdownStatus,
   isEnforcementCompliant,
 };

@@ -8,7 +8,7 @@ const { removeDnsFirewall } = require('./firewall');
 
 const { removeMongoNrptRules } = require('./mongoDns');
 
-const { runLockdown, startNetworkWatch } = require('./networkWatch');
+const { runLockdown, startNetworkWatch, runWatchCheck, setWatchFastFallback } = require('./networkWatch');
 
 const { logPolicyModeStartup, getPolicyMode } = require('./policyMode');
 
@@ -46,6 +46,10 @@ const { buildMockLockdownResult } = require('./mockEnforcement');
 
 const { startProdServer } = require('./prodServer');
 
+const { startTamperWatch } = require('./tamperWatch');
+
+const { invalidateDnsStatusCache } = require('./dnsStatusCache');
+
 require('./ipc');
 
 
@@ -53,6 +57,8 @@ require('./ipc');
 let mainWindow;
 
 let prodServer = null;
+
+let tamperStop = null;
 
 let lastLoadedUrl = null;
 
@@ -139,6 +145,32 @@ function loadErrorPage(win, message) {
 <p style="color:#a1a1aa">${message || 'Unexpected error'}</p></div></body></html>`;
 
   win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+
+}
+
+
+
+function handleTamperEvent({ vector }) {
+
+  if (vector === 'sensor_down') {
+
+    logger.warn('TAMPER', 'Event sensor unavailable — reverting to fast polling backstop');
+
+    setWatchFastFallback(true);
+
+    return;
+
+  }
+
+  logger.info('TAMPER', `Tamper event (${vector}) — re-verifying enforcement`);
+
+  invalidateDnsStatusCache();
+
+  runWatchCheck(`event:${vector}`).catch((e) =>
+
+    logger.error('TAMPER', 'Event-triggered watch check failed', e.message),
+
+  );
 
 }
 
@@ -313,6 +345,12 @@ async function runBackgroundLockdown() {
 
     setNetworkWatchStop(startNetworkWatch());
 
+    // Event-driven tamper detection: react instantly to OS change notifications
+
+    // instead of fast polling. The network watch above is now a slow backstop.
+
+    tamperStop = startTamperWatch({ onTamper: handleTamperEvent });
+
     getDnsHealthMonitor({
 
       onStatusChange: (report) => {
@@ -378,6 +416,18 @@ app.whenReady().then(async () => {
 
 
 app.on('will-quit', () => {
+
+  if (tamperStop) {
+
+    try {
+
+      tamperStop();
+
+    } catch {}
+
+    tamperStop = null;
+
+  }
 
   if (prodServer) {
 

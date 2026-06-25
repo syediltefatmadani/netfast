@@ -8,17 +8,13 @@ const { removeDnsFirewall } = require('./firewall');
 
 const { removeMongoNrptRules } = require('./mongoDns');
 
-const { runLockdown, startNetworkWatch, runWatchCheck, setWatchFastFallback } = require('./networkWatch');
+const { runLockdown } = require('./networkWatch');
 
 const { logPolicyModeStartup, getPolicyMode } = require('./policyMode');
-
-const { getDnsHealthMonitor } = require('./services/dns');
 
 const {
 
   checkDeadlineOnStartup,
-
-  setNetworkWatchStop,
 
   isEnforcementDisabled,
 
@@ -46,9 +42,9 @@ const { buildMockLockdownResult } = require('./mockEnforcement');
 
 const { startProdServer } = require('./prodServer');
 
-const { startTamperWatch } = require('./tamperWatch');
+const monitorManager = require('./monitoring/monitorManager');
 
-const { invalidateDnsStatusCache } = require('./dnsStatusCache');
+const { createTray, updateTray, destroyTray, showBackgroundMonitoringNotificationOnce } = require('./tray');
 
 require('./ipc');
 
@@ -58,9 +54,12 @@ let mainWindow;
 
 let prodServer = null;
 
-let tamperStop = null;
-
 let lastLoadedUrl = null;
+
+// Tray-app lifecycle: closing the window only HIDES it; the app (and monitoring)
+// keeps running in the tray. We only truly exit when the user picks Quit, which
+// flips this flag so the window 'close' handler stops intercepting.
+let isQuitting = false;
 
 
 
@@ -68,13 +67,32 @@ let lastLoadedUrl = null;
 
 function restoreMainWindow() {
 
-  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (!mainWindow || mainWindow.isDestroyed()) {
+
+    createWindow();
+
+    return;
+
+  }
 
   if (mainWindow.isMinimized()) mainWindow.restore();
 
   if (!mainWindow.isVisible()) mainWindow.show();
 
   mainWindow.focus();
+
+}
+
+
+
+/** Explicit, controlled quit (tray > Quit). Lets the window close + app cleanup run. */
+function quitApp() {
+
+  logger.info('TRAY', 'Quit requested from tray');
+
+  isQuitting = true;
+
+  app.quit();
 
 }
 
@@ -166,32 +184,6 @@ function loadErrorPage(win, message) {
 
 
 
-function handleTamperEvent({ vector }) {
-
-  if (vector === 'sensor_down') {
-
-    logger.warn('TAMPER', 'Event sensor unavailable — reverting to fast polling backstop');
-
-    setWatchFastFallback(true);
-
-    return;
-
-  }
-
-  logger.info('TAMPER', `Tamper event (${vector}) — re-verifying enforcement`);
-
-  invalidateDnsStatusCache();
-
-  runWatchCheck(`event:${vector}`).catch((e) =>
-
-    logger.error('TAMPER', 'Event-triggered watch check failed', e.message),
-
-  );
-
-}
-
-
-
 async function createWindow() {
 
   mainWindow = new BrowserWindow({
@@ -236,6 +228,16 @@ async function createWindow() {
 
 
   registerCrashHandlers(mainWindow);
+
+  // Close button must NOT quit the app — hide the window and keep monitoring
+  // running in the background. The app only exits via tray > Quit (isQuitting).
+  mainWindow.on('close', (event) => {
+    if (isQuitting) return;
+    event.preventDefault();
+    mainWindow.hide();
+    showBackgroundMonitoringNotificationOnce();
+    logger.info('TRAY', 'Window hidden — monitoring continues in background');
+  });
 
 
 
@@ -372,33 +374,9 @@ async function runBackgroundLockdown() {
 
 
 
-    setNetworkWatchStop(startNetworkWatch());
-
-    // Event-driven tamper detection: react instantly to OS change notifications
-
-    // instead of fast polling. The network watch above is now a slow backstop.
-
-    tamperStop = startTamperWatch({ onTamper: handleTamperEvent });
-
-    getDnsHealthMonitor({
-
-      onStatusChange: (report) => {
-
-        if (!report.healthy) {
-
-          logger.warn('DNS_HEALTH', 'Protection inactive', {
-
-            status: report.status,
-
-            details: report.details,
-
-          });
-
-        }
-
-      },
-
-    }).start();
+    // Single owner for the background monitoring lifecycle (network watch +
+    // event-driven tamper sensor + DNS health). Idempotent: safe to call again.
+    monitorManager.start();
 
 
 
@@ -452,6 +430,15 @@ if (!gotSingleInstanceLock) {
     await createWindow();
     windowTimer.end();
 
+    createTray({
+      onOpen: restoreMainWindow,
+      onQuit: quitApp,
+      getStatus: () => monitorManager.getStatus(),
+    });
+
+    // Keep the tray's protection-status line fresh as monitoring state changes.
+    monitorManager.addStatusListener(() => updateTray());
+
     const challenge = await getSavedChallengeState();
     if (shouldRunStartupLockdown(challenge) && !isEnforcementDisabled()) {
       setEnforcementInProgress(true);
@@ -465,19 +452,27 @@ if (!gotSingleInstanceLock) {
 
 
 
+// Any quit path (tray Quit, OS shutdown, dev exit) must release the window
+// 'close' interceptor so the app can actually exit.
+app.on('before-quit', () => {
+
+  isQuitting = true;
+
+});
+
+
+
 app.on('will-quit', () => {
 
-  if (tamperStop) {
+  // Stop the whole monitoring lifecycle through its single owner.
 
-    try {
+  try {
 
-      tamperStop();
+    monitorManager.stop();
 
-    } catch {}
+  } catch {}
 
-    tamperStop = null;
-
-  }
+  destroyTray();
 
   if (prodServer) {
 
@@ -495,12 +490,6 @@ app.on('will-quit', () => {
 
     logger.info('STARTUP', 'Skipping quit cleanup — real enforcement was not applied');
 
-    try {
-
-      getDnsHealthMonitor().stop();
-
-    } catch {}
-
     return;
 
   }
@@ -508,8 +497,6 @@ app.on('will-quit', () => {
 
 
   try {
-
-    getDnsHealthMonitor().stop();
 
     removeMongoNrptRules();
 
@@ -523,7 +510,10 @@ app.on('will-quit', () => {
 
 app.on('window-all-closed', () => {
 
-  if (process.platform !== 'darwin') app.quit();
+  // Intentionally do NOT quit here. NetFast is a tray app: the window hides on
+  // close and monitoring keeps running. The app only exits via tray > Quit.
+
+  logger.info('TRAY', 'All windows closed — staying alive in tray');
 
 });
 

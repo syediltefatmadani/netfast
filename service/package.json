@@ -1,0 +1,8 @@
+{
+  "name": "netfast-service",
+  "version": "0.2.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "NetFastService — dedicated Windows background monitoring engine for NetFast.",
+  "main": "index.js"
+}

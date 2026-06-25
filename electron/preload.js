@@ -12,4 +12,9 @@ contextBridge.exposeInMainWorld('electron', {
     ipcRenderer.on('status-refreshed', listener);
     return () => ipcRenderer.removeListener('status-refreshed', listener);
   },
+  onMonitoringStatusChanged: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('monitoring:statusChanged', listener);
+    return () => ipcRenderer.removeListener('monitoring:statusChanged', listener);
+  },
 });

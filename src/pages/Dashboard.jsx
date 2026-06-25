@@ -6,6 +6,7 @@ import StreakRing from '../components/StreakRing';
 import VectorStatusGrid from '../components/VectorStatusGrid';
 import IdentityBanner from '../components/IdentityBanner';
 import VpnWarningModal from '../components/VpnWarningModal';
+import ServiceStatusCard from '../components/ServiceStatusCard';
 
 function useTicker() {
   const [, setTick] = useState(0);
@@ -109,10 +110,15 @@ export default function Dashboard() {
     // refreshVectors is guarded so the re-fetch is a cheap cache read.
     const unsubscribeRefreshed =
       window.electron?.onStatusRefreshed?.(() => refreshVectors()) ?? (() => {});
+    // Main-process MonitorManager pushes this whenever protection status changes;
+    // the renderer just re-reads cached status (refreshVectors is guarded).
+    const unsubscribeMonitoring =
+      window.electron?.onMonitoringStatusChanged?.(() => refreshVectors()) ?? (() => {});
     return () => {
       clearInterval(id);
       unsubscribeEnforcement();
       unsubscribeRefreshed();
+      unsubscribeMonitoring();
     };
   }, [loadAll, refreshVectors]);
 
@@ -231,6 +237,8 @@ export default function Dashboard() {
           <VectorStatusGrid />
 
           <div className="space-y-4">
+            <ServiceStatusCard />
+
             <button
               onClick={() => navigate({ to: '/struggling' })}
               className="w-full flex items-center justify-center gap-3 py-6 rounded-2xl bg-[#ef4444] hover:bg-[#dc2626] text-white text-lg font-medium transition"

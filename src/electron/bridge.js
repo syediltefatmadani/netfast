@@ -63,4 +63,29 @@ export const electronBridge = {
     if (window.electron) return await window.electron.invoke('sync-challenge-state', challenge);
     return null;
   },
+  // ---- NetFastService (Phase 2 background service) ----
+  getServiceStatus: async () => {
+    if (window.electron) return await window.electron.invoke('service:getStatus');
+    return { serviceReachable: false, serviceRunning: false, monitoringActive: false };
+  },
+  getServiceProtectionStatus: async () => {
+    if (window.electron) return await window.electron.invoke('service:getProtectionStatus');
+    return null;
+  },
+  getServiceViolations: async () => {
+    if (window.electron) return await window.electron.invoke('service:getViolations');
+    return [];
+  },
+  serviceManualCheck: async () => {
+    if (window.electron) return await window.electron.invoke('service:manualCheck');
+    return null;
+  },
+  serviceStartChallenge: async (payload) => {
+    if (window.electron) return await window.electron.invoke('service:startChallenge', payload);
+    return null;
+  },
+  serviceStopChallenge: async () => {
+    if (window.electron) return await window.electron.invoke('service:stopChallenge');
+    return null;
+  },
 };

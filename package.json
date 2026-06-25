@@ -22,7 +22,15 @@
     "format": "prettier --write .",
     "test:dns": "node --test electron/services/dns/tests/*.test.js",
     "health-doh": "node electron/cli.js health-doh",
-    "diagnose-domain": "node electron/cli.js diagnose-domain"
+    "diagnose-domain": "node electron/cli.js diagnose-domain",
+    "service:run": "node service/index.js",
+    "service:build": "node -e \"console.log('NetFastService is plain JS — no build step required.')\"",
+    "service:install": "node service/install.js",
+    "service:uninstall": "node service/uninstall.js",
+    "service:start": "node service/control.js start",
+    "service:stop": "node service/control.js stop",
+    "service:status": "node service/control.js status",
+    "service:logs": "node service/logs.js"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.2.2",
@@ -100,7 +108,7 @@
     "appId": "app.focuslock.desktop",
     "productName": "FocusLock",
     "directories": { "output": "dist-electron" },
-    "files": ["dist/**/*", "electron/**/*", "node_modules/**/*"],
+    "files": ["dist/**/*", "electron/**/*", "service/**/*", "shared/**/*", "node_modules/**/*"],
     "win": { "target": "nsis", "requestedExecutionLevel": "requireAdministrator" },
     "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "runAfterFinish": true }
   },

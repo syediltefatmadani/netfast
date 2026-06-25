@@ -36,6 +36,8 @@ const { getPolicyMode, getModeLabel, isDeveloperMode, buildPolicyStatusSnapshot 
 const { getEnforcementStatus } = require('./enforcementState');
 const { isRealEnforcementAllowed } = require('./enforcementGuard');
 const { saveChallengeState } = require('./challengeState');
+const monitorManager = require('./monitoring/monitorManager');
+const serviceClient = require('./serviceClient');
 
 let dnsGapStart = null;
 
@@ -217,10 +219,91 @@ function buildProtectionUiStatus(config, health) {
 
 ipcMain.handle('get-enforcement-status', async () => getEnforcementStatus());
 
+// Monitoring control surface. The renderer is a control panel only: it reads
+// status, can request start/stop, and pulls recent logs — the monitoring engine
+// itself lives entirely in the main process (MonitorManager).
+ipcMain.handle('monitoring:getStatus', async () => monitorManager.getStatus());
+
+ipcMain.handle('monitoring:start', async () => {
+  logger.info('IPC', 'monitoring:start');
+  return monitorManager.start();
+});
+
+ipcMain.handle('monitoring:stop', async () => {
+  logger.info('IPC', 'monitoring:stop');
+  return monitorManager.stop();
+});
+
+ipcMain.handle('monitoring:getLogs', async (_event, payload = {}) => {
+  const limit = Number(payload.limit) || 200;
+  const tags = Array.isArray(payload.tags) ? payload.tags : null;
+  return logger.getRecentLogs(limit, tags);
+});
+
 ipcMain.handle('sync-challenge-state', async (_event, challenge) => {
   const saved = saveChallengeState(challenge);
   logger.info('IPC', 'Challenge state synced', saved);
+
+  // Mirror challenge state into the background service so it knows whether to run
+  // the full monitoring schedule + heartbeats. Best-effort and non-blocking: the
+  // app must keep working even if the service is not installed/running.
+  (async () => {
+    try {
+      if (saved && saved.status === 'active') {
+        await serviceClient.startChallenge({
+          challengeId: saved.id,
+          userId: challenge?.userId || challenge?.user?.id || null,
+          authToken: challenge?.authToken || challenge?.token || null,
+        });
+      } else {
+        await serviceClient.stopChallenge();
+      }
+    } catch (e) {
+      logger.warn('IPC', 'Could not mirror challenge state to service', e.message);
+    }
+  })();
+
   return saved;
+});
+
+// ---- NetFastService bridge (Phase 2) ----
+// The renderer reads/controls the Windows background service through these
+// channels; Electron main proxies to the service's loopback API so the token
+// never leaves the trusted main process.
+ipcMain.handle('service:getStatus', async () => serviceClient.getStatus());
+
+ipcMain.handle('service:getProtectionStatus', async () => serviceClient.getProtectionStatus());
+
+ipcMain.handle('service:getViolations', async () => serviceClient.getViolations());
+
+ipcMain.handle('service:manualCheck', async () => {
+  logger.info('IPC', 'service:manualCheck');
+  try {
+    return await serviceClient.manualCheck();
+  } catch (e) {
+    logger.warn('IPC', 'service:manualCheck failed', e.message);
+    return { error: e.message };
+  }
+});
+
+ipcMain.handle('service:startChallenge', async (_event, payload = {}) => {
+  logger.info('IPC', 'service:startChallenge', { challengeId: payload.challengeId });
+  try {
+    return await serviceClient.startChallenge(payload);
+  } catch (e) {
+    logger.warn('IPC', 'service:startChallenge failed', e.message);
+    return { error: e.message };
+  }
+});
+
+ipcMain.handle('service:stopChallenge', async () => {
+  logger.info('IPC', 'service:stopChallenge');
+  try {
+    return await serviceClient.stopChallenge();
+  } catch (e) {
+    logger.warn('IPC', 'service:stopChallenge failed', e.message);
+    return { error: e.message };
+  }
 });
 
 ipcMain.handle('get-dns-status', async () => {
